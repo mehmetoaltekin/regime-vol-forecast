@@ -153,3 +153,36 @@ def test_eligibility_rule():
     few = {"US500": d("2012-01-03"), "USTEC": d("2012-01-03"), "DE40": d("2012-01-03")}
     _, kept, verdict = ad.eligibility(few)
     assert kept == ["US500", "USTEC"] and "NOT MET" in verdict
+
+
+def test_stale_prices_flags_a_frozen_day():
+    df = make_m1(weeks=2)
+    frozen = df["ts"].dt.normalize() == pd.Timestamp("2024-01-04")
+    df.loc[frozen, ["open", "high", "low", "close"]] = 123.0
+    st = ad.stale_prices(ad.prepare(df))
+    day = st.loc[pd.Timestamp("2024-01-04")]
+    assert day["zero_return_share"] == 1.0 and day["longest_flat_run"] == 22 * 60 - 1
+    others = st.drop(pd.Timestamp("2024-01-04"))
+    assert (others["zero_return_share"] < 0.01).all() and (others["longest_flat_run"] <= 2).all()
+
+
+def test_dense_start_skips_sparse_early_history():
+    dense = make_m1(start="2024-03-04", weeks=12)                       # more dense than sparse days: the reference is the recent median
+    daily = pd.DataFrame({"ts": pd.bdate_range("2024-01-01", "2024-03-01")}).assign(
+        open=100.0, high=100.0, low=100.0, close=100.0, tickvol=1, vol=0, spread=0)       # one bar per day
+    dl = ad.day_lengths(ad.prepare(pd.concat([daily, dense], ignore_index=True)))
+    assert ad.dense_start(dl) == pd.Timestamp("2024-03-04")
+    assert ad.dense_start(dl.iloc[-10:]) is None                        # fewer days than the 20-day window
+
+
+def test_missing_runs_groups_consecutive_business_days():
+    days = pd.DatetimeIndex(["2025-04-18", "2025-07-17", "2025-07-18", "2025-07-21", "2025-07-22", "2025-12-25"])
+    runs = ad.missing_runs(days)
+    assert len(runs) == 1
+    assert runs.loc[0, "from"] == pd.Timestamp("2025-07-17") and runs.loc[0, "to"] == pd.Timestamp("2025-07-22")
+    assert runs.loc[0, "weekdays"] == 4
+
+
+def test_ranges_summarises_above_the_limit():
+    assert ad.ranges([0, 2, 4, 6], limit=3) == "4 minutes in 4 ranges between 00:00 and 00:06"
+    assert ad.ranges([0, 2, 4], limit=3) == "00:00, 00:02, 00:04"

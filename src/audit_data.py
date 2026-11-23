@@ -34,6 +34,7 @@ ELIGIBILITY_CUTOFF = pd.Timestamp("2014-12-31")      # history must start on or 
 SAMPLE_END = pd.Timestamp("2026-10-31")
 SPREAD_MULT = 3.0                                    # rollover rule: minute median > 3 x all-day median
 SHORT_DAY_SHARE = 0.5                                # short-day rule: fewer than 50% of the median day length
+STALE_SHARE = 0.5                                    # a "stale day": more than half of its one-minute returns are zero
 JUMP_NS = (10, 20, 30)                               # thresholds in robust standard deviations
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 COLS = ["date", "time", "open", "high", "low", "close", "tickvol", "vol", "spread"]
@@ -64,8 +65,8 @@ def hm(m: int) -> str:
     return f"{int(m) // 60:02d}:{int(m) % 60:02d}"
 
 
-def ranges(minutes) -> str:
-    """Sorted minute-of-day values -> '00:00-00:59, 23:15-23:29' (inclusive ranges)."""
+def ranges(minutes, limit: int | None = None) -> str:
+    """Sorted minute-of-day values -> '00:00-00:59, 23:15-23:29' (inclusive ranges); a summary above `limit` ranges."""
     ms = sorted(int(x) for x in minutes)
     if not ms:
         return "none"
@@ -77,6 +78,8 @@ def ranges(minutes) -> str:
         out.append((a, b))
         a = b = x
     out.append((a, b))
+    if limit is not None and len(out) > limit:
+        return f"{len(ms)} minutes in {len(out)} ranges between {hm(ms[0])} and {hm(ms[-1])}"
     return ", ".join(hm(a) if a == b else f"{hm(a)}-{hm(b)}" for a, b in out)
 
 
@@ -120,6 +123,7 @@ def weekend(d: pd.DataFrame) -> dict:
     return {
         "saturday_bars": len(sat),
         "saturday_days": int(sat["day"].nunique()),
+        "saturday_dates": [str(x.date()) for x in sorted(sat["day"].unique())[:10]],
         "sunday_bars": len(sun),
         "sunday_days": int(sun["day"].nunique()),
         "weeks": int(weeks),
@@ -178,7 +182,7 @@ def session_table(in_sess: np.ndarray, years: list) -> pd.DataFrame:
     for k, y in enumerate(years):
         row = {"year": int(y)}
         for wd in (6, 0, 2, 4):
-            row[WEEKDAYS[wd]] = ranges(np.nonzero(in_sess[k, wd])[0])
+            row[WEEKDAYS[wd]] = ranges(np.nonzero(in_sess[k, wd])[0], limit=6)
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -241,7 +245,7 @@ def spread_profile(d: pd.DataFrame) -> dict:
         med = float(g["spread"].median())
         by_year.append({"year": int(y), "median_spread": med, "zero_spread_share": float((g["spread"] == 0).mean()),
                         "distinct_values": int(g["spread"].nunique()),
-                        "minutes_over_3x": ranges(p.index[p > SPREAD_MULT * med]) if med > 0 else "n/a (median 0)"})
+                        "minutes_over_3x": ranges(p.index[p > SPREAD_MULT * med], limit=12) if med > 0 else "n/a (median 0)"})
     return {"profile": prof, "median_all_bars": all_bars, "median_of_minute_medians": of_minutes,
             "flagged": list(flagged), "flagged_alt": list(flagged_b), "by_year": pd.DataFrame(by_year)}
 
@@ -285,7 +289,41 @@ def jumps(d: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     return big[["ts", "r", "scale", "z", "reverted"]], counts
 
 
-def year_table(d: pd.DataFrame, per_day: pd.DataFrame, dl: pd.DataFrame) -> pd.DataFrame:
+def stale_prices(d: pd.DataFrame) -> pd.DataFrame:
+    """Per trading day: share of one-minute steps with an unchanged close, and the longest run of unchanged closes."""
+    c, t, day = d["close"].to_numpy(), d["ts"].to_numpy(), d["tday"].to_numpy()
+    step = (np.diff(t) == np.timedelta64(1, "m")) & (day[1:] == day[:-1])
+    flat = step & (c[1:] == c[:-1])
+    cs = np.cumsum(flat)
+    run = cs - np.maximum.accumulate(np.where(flat, 0, cs))            # length of the flat run ending at each step
+    x = pd.DataFrame({"tday": day[1:], "step": step, "flat": flat, "run": run})
+    g = x.groupby("tday").agg(steps=("step", "sum"), flat=("flat", "sum"), longest_flat_run=("run", "max"))
+    g["zero_return_share"] = g["flat"] / g["steps"].where(g["steps"] > 0)
+    return g
+
+
+def dense_start(dl: pd.DataFrame, window: int = 20):
+    """
+    First day of the first run of `window` consecutive trading days that each have at least half as many active
+    5-minute intervals as the median of the last 500 trading days: where minute-resolution history begins.
+    """
+    ok = (dl["n5_active"] >= 0.5 * dl["n5_active"].tail(500).median()).to_numpy()
+    full = np.convolve(ok, np.ones(window, dtype=int), "valid") == window
+    return dl.index[int(np.argmax(full))] if full.any() else None
+
+
+def missing_runs(days: pd.DatetimeIndex, min_len: int = 3) -> pd.DataFrame:
+    """Runs of consecutive missing Monday-Friday days."""
+    if len(days) == 0:
+        return pd.DataFrame(columns=["from", "to", "weekdays"])
+    s = pd.Series(days)
+    new = (s - pd.tseries.offsets.BDay(1)) != s.shift()
+    runs = s.groupby(new.cumsum()).agg(["min", "max", "size"])
+    runs.columns = ["from", "to", "weekdays"]
+    return runs[runs["weekdays"] >= min_len].reset_index(drop=True)
+
+
+def year_table(d: pd.DataFrame, per_day: pd.DataFrame, dl: pd.DataFrame, st: pd.DataFrame, big: pd.DataFrame) -> pd.DataFrame:
     g = d.groupby("year")
     t = pd.DataFrame({
         "bars": g.size(),
@@ -299,6 +337,10 @@ def year_table(d: pd.DataFrame, per_day: pd.DataFrame, dl: pd.DataFrame) -> pd.D
     t["missing_share_%"] = 100 * t["missing_in_session"] / t["in_session_slots"]
     t["short_days_active"] = dl.groupby(dl.index.year)["short_n5_active"].sum()
     t["short_days_span"] = dl.groupby(dl.index.year)["short_n5_span"].sum()
+    t["median_zero_return_%"] = 100 * st.groupby(st.index.year)["zero_return_share"].median()
+    t["stale_days"] = (st["zero_return_share"] > STALE_SHARE).groupby(st.index.year).sum()
+    t[f"jumps_gt_{JUMP_NS[1]}sd"] = big[big["z"].abs() > JUMP_NS[1]].groupby(big["ts"].dt.year).size()
+    t[f"jumps_gt_{JUMP_NS[1]}sd"] = t[f"jumps_gt_{JUMP_NS[1]}sd"].fillna(0).astype(int)
     return t.reset_index()
 
 
@@ -311,10 +353,12 @@ def audit_symbol(sym: str, path: Path) -> dict:
     per_day, gaps = missing_minutes(d, in_sess, years)
     dl = day_lengths(d)
     big, jump_counts = jumps(d)
+    st = stale_prices(d)
     res.update({
         "weekend": weekend(d), "sessions": session_table(in_sess, years), "edges": day_edges(d), "dst": dst_shifts(d),
         "per_day": per_day, "gaps": gaps, "missing_weekdays": missing_weekdays(d), "spread": spread_profile(d),
-        "day_lengths": dl, "jumps": big, "jump_counts": jump_counts, "years": year_table(d, per_day, dl),
+        "day_lengths": dl, "jumps": big, "jump_counts": jump_counts, "years": year_table(d, per_day, dl, st, big),
+        "stale": st, "dense_start": dense_start(dl),
         "first_day": d["day"].min(), "last_day": d["day"].max(),
     })
     return res
@@ -368,6 +412,13 @@ def symbol_section(r: dict, meta: dict) -> str:
     b, w, sp, dl, jc = r["basic"], r["weekend"], r["spread"], r["day_lengths"], r["jump_counts"]
     m = meta.get(r["symbol"], {})
     pd_, gaps = r["per_day"], r["gaps"]
+    runs = missing_runs(r["missing_weekdays"])
+    st = r["stale"]
+    dense = dl[dl.index >= r["dense_start"]] if r["dense_start"] is not None else dl.iloc[:0]
+    stale_month = st.assign(stale=st["zero_return_share"] > STALE_SHARE).groupby(st.index.to_period("M")).agg(
+        days=("stale", "size"), stale_days=("stale", "sum"), median_zero_return_share=("zero_return_share", "median"),
+        longest_flat_run=("longest_flat_run", "max"))
+    stale_month = stale_month[stale_month["stale_days"] > 0].sort_values("stale_days", ascending=False).rename_axis("month").reset_index()
     L = [f"## {r['symbol']}", ""]
     L += [f"- File: `{r['file']}`",
           f"- First bar {b['first']:%Y-%m-%d %H:%M}, last bar {b['last']:%Y-%m-%d %H:%M}, {b['bars']:,} bars "
@@ -376,13 +427,16 @@ def symbol_section(r: dict, meta: dict) -> str:
           f"description \"{m.get('description', '')}\"",
           f"- Export: series synchronised {m.get('series_synchronized', '?')}, reached the server's first date "
           f"{m.get('reached_server_first_date', '?')} (server first date {m.get('server_first_date', '?')})",
+          f"- Minute-resolution history from: **{r['dense_start'].date() if r['dense_start'] is not None else 'never'}** "
+          "(first of 20 consecutive trading days with at least half the recent number of active 5-minute intervals)",
           f"- Duplicate timestamps: {b['duplicate_timestamps']:,}; out-of-order rows: {b['out_of_order']:,}; "
           f"timestamps not on a full minute: {b['off_minute_timestamps']:,}; rows with missing values: {b['missing_values']:,}",
           f"- Zero or negative prices: {b['nonpositive_price_rows']:,} rows; `high < low`: {b['high_lt_low']:,} rows; "
           f"high below max(open, close) or low above min(open, close): {b['ohlc_inconsistent']:,} rows", ""]
 
     L += ["### Weekend bars", "",
-          f"- Saturday: {w['saturday_bars']:,} bars on {w['saturday_days']} days",
+          f"- Saturday: {w['saturday_bars']:,} bars on {w['saturday_days']} days"
+          + (f" ({', '.join(w['saturday_dates'])}{' ...' if w['saturday_days'] > 10 else ''})" if w["saturday_days"] else ""),
           f"- Sunday: {w['sunday_bars']:,} bars on {w['sunday_days']} days ({w['weeks']} weeks in the file)"
           + (f"; first Sunday bar usually at {w['sunday_first_bar_mode']} (range {w['sunday_first_bar_range']})" if w["sunday_days"] else ""),
           f"- Sundays with bars per year: {w['sunday_days_by_year'] or 'none'}", ""]
@@ -410,6 +464,8 @@ def symbol_section(r: dict, meta: dict) -> str:
           f"{int((gaps['in_session_minutes'] >= 60).sum()):,}",
           f"- Monday-Friday calendar days without any bar: {len(r['missing_weekdays'])} "
           f"(list in `data_audit/missing_weekdays_{r['symbol']}.csv`)", "",
+          "Runs of 3 or more consecutive Monday-Friday days without any bar:", "",
+          md_table(runs) if len(runs) else "None.", "",
           "Largest interior gaps:", "",
           md_table(gaps.sort_values("in_session_minutes", ascending=False).head(10)), ""]
 
@@ -430,6 +486,11 @@ def symbol_section(r: dict, meta: dict) -> str:
           f"days below {SHORT_DAY_SHARE:.0%} of it: {int(dl['short_n5_active'].sum())}",
           f"- 5-minute grid returns from the day's first to last bar: median {dl['n5_span'].median():.0f}; "
           f"days below {SHORT_DAY_SHARE:.0%} of it: {int(dl['short_n5_span'].sum())}",
+          f"- Counted only from the minute-resolution start ({len(dense):,} days): "
+          f"{int((dense['n5_active'] < SHORT_DAY_SHARE * dense['n5_active'].median()).sum())} short days by the active count "
+          f"(median {dense['n5_active'].median():.0f}), "
+          f"{int((dense['n5_span'] < SHORT_DAY_SHARE * dense['n5_span'].median()).sum())} by the span count "
+          f"(median {dense['n5_span'].median():.0f})",
           f"- Short days by weekday (active count): "
           f"{dl[dl['short_n5_active']].groupby('weekday').size().to_dict() or 'none'}",
           f"- Daily values: `data_audit/day_lengths_{r['symbol']}.csv`", ""]
@@ -440,6 +501,16 @@ def symbol_section(r: dict, meta: dict) -> str:
             for n in JUMP_NS],
           f"- All returns above {min(JUMP_NS)} robust SD: `data_audit/jumps_{r['symbol']}.csv`", "",
           "Largest:", "", md_table(r["jumps"].head(10), "{:.3f}"), ""]
+
+    L += ["### Stale prices", "",
+          f"A stale day has more than {STALE_SHARE:.0%} of its one-minute returns equal to zero.", "",
+          f"- Stale days: {int((st['zero_return_share'] > STALE_SHARE).sum()):,} of {len(st):,}; "
+          f"of the {len(dense):,} days from the minute-resolution start: "
+          f"{int((st.loc[st.index.isin(dense.index), 'zero_return_share'] > STALE_SHARE).sum()):,}",
+          f"- Longest run of unchanged one-minute closes: {int(st['longest_flat_run'].max()):,} minutes "
+          f"(on {st['longest_flat_run'].idxmax().date()})", "",
+          "Months with stale days (15 worst):", "",
+          md_table(stale_month.head(15), "{:.3f}") if len(stale_month) else "None.", ""]
 
     L += ["### By year", "", md_table(r["years"]), ""]
     return "\n".join(L)
@@ -452,6 +523,7 @@ def write_csvs(r: dict) -> None:
     r["jumps"].to_csv(OUT_DIR / f"jumps_{s}.csv", index=False, float_format="%.6g")
     r["gaps"].to_csv(OUT_DIR / f"gaps_{s}.csv", index=False)
     r["edges"].to_csv(OUT_DIR / f"day_edges_{s}.csv", index=False)
+    r["stale"].to_csv(OUT_DIR / f"stale_{s}.csv", index_label="trading_day", float_format="%.4f")
     pd.Series(r["missing_weekdays"], name="day").to_csv(OUT_DIR / f"missing_weekdays_{s}.csv", index=False)
 
 
@@ -478,10 +550,20 @@ def main() -> None:
          f"- Server time minus GMT at export: {term.get('server_minus_gmt_hours', '?')} h "
          "(only meaningful if the terminal was connected)",
          f"- Symbols present: {', '.join(results)}; missing: {', '.join(s for s in order if s not in results) or 'none'}",
-         "- All times are broker server time. A trading day is a server calendar day; Sunday bars count with Monday.", "",
+         "- All times are broker server time. A trading day is a server calendar day; Sunday bars count with Monday.", ""]
+    last = max(r["basic"]["last"] for r in results.values())
+    missing = [s for s in order if s not in results]
+    if term.get("connected") != "1" or missing or min(r["basic"]["last"] for r in results.values()) < SAMPLE_END:
+        L += ["> **PROVISIONAL.** " + " ".join(filter(None, [
+            "The terminal was offline during the export, so the files hold only what was in its local cache." if term.get("connected") != "1" else "",
+            f"Missing symbols: {', '.join(missing)}." if missing else "",
+            f"At least one file ends before the sample end {SAMPLE_END.date()}." if min(r["basic"]["last"] for r in results.values()) < SAMPLE_END else "",
+            "The eligibility outcome below is not final."])), ""]
+    L += [
          "## Summary", ""]
     summ = pd.DataFrame([{
-        "symbol": s, "first bar": r["basic"]["first"], "last bar": r["basic"]["last"], "bars": f"{r['basic']['bars']:,}",
+        "symbol": s, "first bar": r["basic"]["first"], "minute data from": r["dense_start"], "last bar": r["basic"]["last"],
+        "bars": f"{r['basic']['bars']:,}",
         "mode": meta.get(s, {}).get("chart_mode", "?"), "dup": r["basic"]["duplicate_timestamps"],
         "price<=0": r["basic"]["nonpositive_price_rows"], "high<low": r["basic"]["high_lt_low"],
         "Sat bars": r["weekend"]["saturday_bars"], "Sun days": r["weekend"]["sunday_days"],
@@ -489,10 +571,18 @@ def main() -> None:
         "spread median": r["spread"]["median_all_bars"], "minutes > 3x": len(r["spread"]["flagged"]),
         "median 5-min/day": r["day_lengths"]["n5_active"].median(), "short days": int(r["day_lengths"]["short_n5_active"].sum()),
         f"jumps > {JUMP_NS[1]} SD": r["jump_counts"][JUMP_NS[1]]["jumps"],
+        "stale days": int((r["stale"]["zero_return_share"] > STALE_SHARE).sum()),
+        "missing weekdays": len(r["missing_weekdays"]),
     } for s, r in results.items()])
     L += [md_table(summ, "{:.4g}"), "",
           "## Eligibility rule (history must start on or before 2014-12-31)", "",
-          md_table(pd.DataFrame(rows, columns=["asset class", "symbol", "first M1 bar", "outcome", "replacement"])), "",
+          md_table(pd.DataFrame(rows, columns=["asset class", "symbol", "first M1 bar", "outcome", "replacement"]).assign(**{
+              "minute-resolution history from": lambda t: [
+                  (str(results[s.split()[0]]["dense_start"].date()) if results[s.split()[0]]["dense_start"] is not None else "never")
+                  if s.split()[0] in results else "" for s in t["symbol"]]})), "",
+          "The outcome applies the rule as written, to the first M1 bar in the file. The last column shows where "
+          "minute-by-minute history actually begins; where the two dates differ, the bars before the second date are "
+          "not one-minute data (see the symbol's section).", "",
           f"- Retained: {', '.join(kept) or 'none'}", f"- {verdict}"]
     if kept and all(k in results for k in kept):
         L.append(f"- First server day on which all retained instruments have data: {max(results[k]['first_day'] for k in kept).date()}")
