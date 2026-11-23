@@ -1,7 +1,10 @@
 """
 Export the M1 history of the study's symbols from the local MT5 terminal (macOS, Wine build).
 
-    python src/mt5_export.py [SYMBOL ...]
+    python src/mt5_export.py [--offline] [SYMBOL ...]
+
+Without --offline the run stops at once if the terminal cannot connect to its trade server; with it, only the
+terminal's local history cache is exported (may be incomplete and end early).
 
 Steps:
   1. copy src/mt5/ExportM1.mq5 into the terminal and compile it with MetaEditor,
@@ -106,7 +109,9 @@ def sha256(path: Path) -> str:
 
 
 def main() -> None:
-    syms = sys.argv[1:] or SYMBOLS
+    args = sys.argv[1:]
+    offline = "--offline" in args
+    syms = [a for a in args if a != "--offline"] or SYMBOLS
     if subprocess.run(["pgrep", "-q", "terminal64"]).returncode == 0:
         sys.exit("MT5 terminal is already running; close it first (the export needs its own start-up config).")
     compile_script()
@@ -114,6 +119,8 @@ def main() -> None:
     for p in OUT.glob("*"):
         p.unlink()
     (OUT / "symbols.txt").write_bytes("".join(s + "\r\n" for s in syms).encode("ascii"))
+    if offline:
+        (OUT / "offline_ok.txt").write_bytes(b"1")
     INI.write_bytes(INI_TEXT.encode("ascii"))
 
     t0 = time.time()
@@ -127,6 +134,8 @@ def main() -> None:
         sys.exit("no export_meta.tsv: the script did not run")
     meta = read_meta(meta_path)
     term = meta.get("_terminal", {})
+    if term.get("aborted"):
+        sys.exit("ABORTED: the terminal could not connect to its trade server (log in first, or use --offline).")
     print("terminal:", {k: term.get(k) for k in ("connected", "account_server", "server_minus_gmt_hours", "done")})
 
     RAW.mkdir(parents=True, exist_ok=True)

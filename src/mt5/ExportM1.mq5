@@ -159,6 +159,14 @@ void OnStart()
    Meta(meta, "_terminal", "time_gmt", TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS));
    Meta(meta, "_terminal", "server_minus_gmt_hours", DoubleToString((double)(TimeTradeServer() - TimeGMT()) / 3600.0, 2));
 
+   // offline runs export only the local cache: allowed only when the runner asks for it (offline_ok.txt)
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED) && !FileIsExist(DIR + "offline_ok.txt"))
+     {
+      Meta(meta, "_terminal", "aborted", "not connected");
+      FileClose(meta);
+      return;
+     }
+
    for(int i = 0; i < ns; i++) Export(syms[i], meta);
 
    Meta(meta, "_terminal", "connected_at_end", IntegerToString(TerminalInfoInteger(TERMINAL_CONNECTED)));
