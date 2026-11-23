@@ -550,7 +550,11 @@ def main() -> None:
          f"- Server time minus GMT at export: {term.get('server_minus_gmt_hours', '?')} h "
          "(only meaningful if the terminal was connected)",
          f"- Symbols present: {', '.join(results)}; missing: {', '.join(s for s in order if s not in results) or 'none'}",
-         "- All times are broker server time. A trading day is a server calendar day; Sunday bars count with Monday.", ""]
+         "- All times are broker server time. A trading day is a server calendar day; Sunday bars count with Monday.",
+         "- The export script requests bars from 2000-01-01. Each symbol's section gives the server's first date; "
+         "anything the server holds before 2000 is not in the files.",
+         f"- The files run to the export time; the counts below use every bar in the file, including those after the "
+         f"sample end {SAMPLE_END.date()}.", ""]
     last = max(r["basic"]["last"] for r in results.values())
     missing = [s for s in order if s not in results]
     if term.get("connected") != "1" or missing or min(r["basic"]["last"] for r in results.values()) < SAMPLE_END:
@@ -586,6 +590,9 @@ def main() -> None:
           f"- Retained: {', '.join(kept) or 'none'}", f"- {verdict}"]
     if kept and all(k in results for k in kept):
         L.append(f"- First server day on which all retained instruments have data: {max(results[k]['first_day'] for k in kept).date()}")
+        dense = [results[k]["dense_start"] for k in kept]
+        L.append("- First server day on which all retained instruments have minute-resolution data: "
+                 + (str(max(dense).date()) if all(x is not None for x in dense) else "never"))
     L.append("")
     L += [symbol_section(r, meta) for r in results.values()]
     OUT_MD.write_text("\n".join(L) + "\n")

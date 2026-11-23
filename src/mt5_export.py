@@ -1,7 +1,9 @@
 """
 Export the M1 history of the study's symbols from the local MT5 terminal (macOS, Wine build).
 
-    python src/mt5_export.py [--offline] [SYMBOL ...]
+    python src/mt5_export.py [--offline] [--collect-only] [SYMBOL ...]
+
+--collect-only skips steps 1-2 and only verifies and collects files a previous run left in the terminal folder.
 
 Without --offline the run stops at once if the terminal cannot connect to its trade server; with it, only the
 terminal's local history cache is exported (may be incomplete and end early).
@@ -100,6 +102,21 @@ def check_file(path: Path, m: dict) -> str:
     return ""
 
 
+def status_ok(m: dict) -> bool:
+    """
+    OK, or CHECK only because the market was open: bars that formed while the file was being written make the
+    written count exceed the count reported before writing, by at most one bar per minute of export time.
+    """
+    if m.get("status") == "OK":
+        return True
+    try:
+        extra = int(m["bars_written"]) - int(m["bars_reported"])
+        return (m.get("status") == "CHECK" and m.get("copy_errors") == "0"
+                and 0 <= extra <= float(m["seconds"]) / 60 + 2)
+    except (KeyError, ValueError):
+        return False
+
+
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -111,23 +128,25 @@ def sha256(path: Path) -> str:
 def main() -> None:
     args = sys.argv[1:]
     offline = "--offline" in args
-    syms = [a for a in args if a != "--offline"] or SYMBOLS
+    collect_only = "--collect-only" in args
+    syms = [a for a in args if not a.startswith("--")] or SYMBOLS
     if subprocess.run(["pgrep", "-q", "terminal64"]).returncode == 0:
         sys.exit("MT5 terminal is already running; close it first (the export needs its own start-up config).")
-    compile_script()
-    OUT.mkdir(parents=True, exist_ok=True)
-    for p in OUT.glob("*"):
-        p.unlink()
-    (OUT / "symbols.txt").write_bytes("".join(s + "\r\n" for s in syms).encode("ascii"))
-    if offline:
-        (OUT / "offline_ok.txt").write_bytes(b"1")
-    INI.write_bytes(INI_TEXT.encode("ascii"))
+    if not collect_only:
+        compile_script()
+        OUT.mkdir(parents=True, exist_ok=True)
+        for p in OUT.glob("*"):
+            p.unlink()
+        (OUT / "symbols.txt").write_bytes("".join(s + "\r\n" for s in syms).encode("ascii"))
+        if offline:
+            (OUT / "offline_ok.txt").write_bytes(b"1")
+        INI.write_bytes(INI_TEXT.encode("ascii"))
 
-    t0 = time.time()
-    timeout_s = 1200 * len(syms) + 600
-    wine(["terminal64.exe", r"/config:C:\Program Files\MetaTrader 5\config\rvf_export.ini"], timeout_s)
-    wait_exit("terminal64", timeout_s)
-    print(f"terminal run: {time.time() - t0:.0f} s", flush=True)
+        t0 = time.time()
+        timeout_s = 1200 * len(syms) + 600
+        wine(["terminal64.exe", r"/config:C:\Program Files\MetaTrader 5\config\rvf_export.ini"], timeout_s)
+        wait_exit("terminal64", timeout_s)
+        print(f"terminal run: {time.time() - t0:.0f} s", flush=True)
 
     meta_path = OUT / "export_meta.tsv"
     if not meta_path.exists():
@@ -143,7 +162,7 @@ def main() -> None:
     for s in syms:
         m = meta.get(s, {})
         src = OUT / f"{s}_M1.csv"
-        problem = "" if m.get("status") == "OK" else f"status {m.get('status', 'missing')}"
+        problem = "" if status_ok(m) else f"status {m.get('status', 'missing')}"
         if not problem and m.get("reached_server_first_date") != "1":
             problem = (f"history incomplete: terminal has data from {m.get('terminal_first_date')}, "
                        f"server from {m.get('server_first_date')}")
