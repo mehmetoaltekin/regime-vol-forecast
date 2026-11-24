@@ -17,3 +17,8 @@ venv/
 
 # Detailed audit tables (39 MB); regenerate with: uv run python src/audit_data.py
 results/data_audit/
+
+# Study outputs that are data-like or development-only
+results/forecasts/
+results/dev/
+results/RUN_STARTED.lock
