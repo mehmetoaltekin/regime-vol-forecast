@@ -16,10 +16,22 @@ Variants (PRESPEC section 10), each a full walk-forward run on every instrument 
   vintage                                                            M4-M6 trained on real-time probabilities (check 9)
   harq                                                               HARQ against HARQ plus prob_stress (check 10)
 Check 7 (MSE loss) is the same forecasts evaluated with the MSE loss, per instrument.
+
+Running. The work is split into independent tasks, one walk-forward run per (variant, instrument). The daily rows of an
+instrument are prepared once and stored (`build_bundle`, one file per instrument and sample); a task reads that file,
+runs, and writes its forecasts, regime series and counters atomically with a completion marker. Tasks do not depend on
+each other and use fixed seeds, so the result does not depend on the number of workers or on the order, and an
+interrupted run continues where it stopped. Evaluation reads the stored task results.
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
+import multiprocessing
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Callable
@@ -82,6 +94,7 @@ class StudyConfig:
     window: int = 1000
     refit_every: int = 21
     burn_in: int = 22
+    alt_windows: tuple[int, int] = (750, 1500)             # training windows of robustness check 5
     horizons: tuple[int, ...] = (1, 5, 22)
     min_ess: float = 100.0
     ms_starts: int = 10
@@ -96,7 +109,7 @@ class StudyConfig:
     def from_json(cls, path: Path) -> "StudyConfig":
         d = json.loads(Path(path).read_text())
         d["instruments"] = [InstrumentSpec(**i) for i in d["instruments"]]
-        for k in ("horizons", "variants"):
+        for k in ("horizons", "variants", "alt_windows"):
             if k in d:
                 d[k] = tuple(d[k])
         cfg = cls(**d)
@@ -142,9 +155,9 @@ def variant_setup(name: str, cfg: StudyConfig) -> dict:
         # the log models need M3_log as the fallback of M7_log; M2c is not part of this check
         factory, families = (lambda: M.log_models(cfg.min_ess, cfg.ms_starts)), LOG_FAMILIES
     elif name == "window_750":
-        wf = replace(wf, window=750)
+        wf = replace(wf, window=cfg.alt_windows[0])
     elif name == "window_1500":
-        wf = replace(wf, window=1500)
+        wf = replace(wf, window=cfg.alt_windows[1])
     elif name == "hmm_log_rv":
         regime = RegimeConfig(feature_cols=("log_rv",), sort_by="mean:0")
         factory = lambda: [m for m in M.all_models(cfg.min_ess, cfg.ms_starts) if m.name != "m0"]   # no return variance
@@ -163,37 +176,63 @@ def variant_setup(name: str, cfg: StudyConfig) -> dict:
 
 # ------------------------------------------------------------------------------------------------ data
 
-def prepare_daily(spec: InstrumentSpec, variant: str = "primary", raw_dir: Path = RAW, start: str | None = None,
-                  max_days: int | None = None) -> pd.DataFrame:
+ALT_TARGETS = {"rv_no_break": {"include_session_break": False}, "rv_no_rollover": {"excluded_windows": ()},
+               "rv_1min": {"interval_min": 1}}
+RANGE_TARGETS = ("parkinson", "garman_klass")
+
+
+def build_bundle(spec: InstrumentSpec, raw_dir: Path = RAW, start: str | None = None, max_days: int | None = None,
+                 raw: pd.DataFrame | None = None) -> pd.DataFrame:
     """
-    Retained daily rows of one instrument for one variant. For the target variants only the column 'rv' differs; the
-    retained days, the close-to-close returns and the HMM inputs are those of the primary run.
+    Retained daily rows of one instrument: the primary measures plus one column per alternative target of robustness
+    check 1 (rv_no_break, rv_no_rollover, rv_1min; Parkinson and Garman-Klass are columns of the primary measures).
+
+    The alternative targets are computed with the main run's day flags (short, stale, anchor), so every alternative
+    has exactly the main run's days and a day cannot be lost because a changed window or interval would flag it.
+    An alternative that is missing or not positive on a retained day raises: it is a data problem to be seen before
+    any forecast is made.
 
     max_days (development mode): the M1 data is cut by calendar date, about 1.6 calendar days per wanted day, before
     anything is computed from it, and the result is the first max_days retained days. If the specification fixes no
     median day length, the median comes from that slice, which holds a few weeks more than max_days.
+    raw: the loaded M1 file, if the caller has it already.
     """
-    m1, _ = clean_m1(load_m1(raw_path(spec.symbol, raw_dir)), spec.clean_config(start))
+    raw = load_m1(raw_path(spec.symbol, raw_dir)) if raw is None else raw
+    m1, _ = clean_m1(raw, spec.clean_config(start))
     if max_days is not None:
         m1 = m1[m1["ts"] < m1["ts"].iloc[0].normalize() + pd.Timedelta(days=int(max_days * 1.6))]
-    base = retained(daily_measures(m1, spec.rv_config()))
+    primary = daily_measures(m1, spec.rv_config())
+    base = retained(primary)
     if max_days is not None:
         if len(base) < max_days:
             raise ValueError(f"{spec.symbol}: only {len(base)} retained days in the development slice")
         base = base.iloc[:max_days]
         m1 = m1[m1["ts"] < base.index[-1] + pd.Timedelta(days=1)]
-    if variant in ("parkinson", "garman_klass"):
-        base = base.assign(rv=base[variant])
-    elif variant == "rv_no_break":
-        base = base.assign(rv=retained(daily_measures(m1, spec.rv_config(include_session_break=False)))["rv"].reindex(base.index))
-    elif variant == "rv_no_rollover":
-        base = base.assign(rv=retained(daily_measures(m1, spec.rv_config(excluded_windows=())))["rv"].reindex(base.index))
-    elif variant == "rv_1min":
-        base = base.assign(rv=retained(daily_measures(m1, spec.rv_config(interval_min=1)))["rv"].reindex(base.index))
-    if variant in TARGET_VARIANTS and not (base["rv"] > 0).all():
-        raise ValueError(f"{spec.symbol}/{variant}: the target is missing or not positive on "
-                         f"{int((~(base['rv'] > 0)).sum())} retained days")
+    base = base.copy()
+    flags = primary[["short", "stale", "anchor"]]
+    for name, override in ALT_TARGETS.items():
+        alt = daily_measures(m1, spec.rv_config(**override), flags=flags)
+        if not alt["kept"].reindex(base.index).fillna(False).all():
+            raise ValueError(f"{spec.symbol}/{name}: the alternative run does not keep the main run's days")
+        base[name] = alt["rv"].reindex(base.index)
+    bad = ~(base[[*ALT_TARGETS, *RANGE_TARGETS]] > 0).all(axis=1)
+    if bad.any():
+        raise ValueError(f"{spec.symbol}: an alternative target is missing or not positive on {int(bad.sum())} retained "
+                         f"days (first: {base.index[bad][0].date()})")
     return base
+
+
+def variant_daily(bundle: pd.DataFrame, variant: str) -> pd.DataFrame:
+    """The daily rows one variant runs on: for a target variant the column 'rv' is replaced by that target."""
+    if variant in ALT_TARGETS or variant in RANGE_TARGETS:
+        bundle = bundle.assign(rv=bundle[variant])
+    return bundle.drop(columns=list(ALT_TARGETS))
+
+
+def prepare_daily(spec: InstrumentSpec, variant: str = "primary", raw_dir: Path = RAW, start: str | None = None,
+                  max_days: int | None = None) -> pd.DataFrame:
+    """Retained daily rows of one instrument for one variant (see `build_bundle`)."""
+    return variant_daily(build_bundle(spec, raw_dir, start, max_days), variant)
 
 
 # ------------------------------------------------------------------------------------------------ runs
@@ -216,6 +255,204 @@ def run_variant(name: str, cfg: StudyConfig, daily: dict[str, pd.DataFrame], pro
                 raise
             stopped[sym] = str(e)
     return out
+
+
+# ------------------------------------------------------------------------------------------------ tasks
+
+THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS")
+
+
+def limit_threads() -> None:
+    """One BLAS thread per process: parallel workers then do not fight for cores, and each run is reproducible."""
+    for v in THREAD_VARS:
+        os.environ[v] = "1"
+
+
+def single_thread():
+    """A context in which the BLAS libraries of this process use one thread (so every run computes the same numbers)."""
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:                                    # threadpoolctl comes with scikit-learn, which hmmlearn needs
+        return contextlib.nullcontext()
+    return threadpool_limits(limits=1)
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_atomic(path: Path, write: Callable[[Path], None]) -> None:
+    """Write through a temporary file and rename, so that a file that exists is a complete file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    write(tmp)
+    os.replace(tmp, path)
+
+
+def sample_of(variant: str) -> str:
+    return "long" if variant == "long_history" else "main"
+
+
+def bundle_file(clean_dir: Path, symbol: str, sample: str) -> Path:
+    return Path(clean_dir) / f"daily__{symbol}__{sample}.parquet"
+
+
+def required_days(cfg: StudyConfig, sample: str) -> tuple[int, str]:
+    """The fewest retained days that every variant on this sample needs (burn-in, window and at least one forecast)."""
+    need, why = 0, ""
+    for v in cfg.variants:
+        if sample_of(v) != sample:
+            continue
+        wf = variant_setup(v, cfg)["wf"]
+        n = wf.burn_in + (2 * wf.window + wf.refit_every if wf.vintage_training else wf.window) + 2
+        if n > need:
+            need, why = n, f"variant {v}"
+    return need, why
+
+
+def prepare_instrument(config_path: str, symbol: str, clean_dir: str, raw_dir: str) -> dict[str, str]:
+    """Stage 0 of the full run: the daily bundles of one instrument (its sample, and for check 6 its own history)."""
+    cfg = StudyConfig.from_json(Path(config_path))
+    spec = next(i for i in cfg.instruments if i.symbol == symbol)
+    raw = load_m1(raw_path(symbol, Path(raw_dir)))
+    out = {}
+    samples = [("main", None)]
+    if "long_history" in cfg.variants and symbol in cfg.long_history:
+        samples.append(("long", cfg.long_history[symbol]))
+    for sample, start in samples:
+        bundle = build_bundle(spec, Path(raw_dir), start, raw=raw)
+        need, why = required_days(cfg, sample)
+        if len(bundle) < need:                                # caught here, before the lock: no task could run
+            raise ValueError(f"{symbol} ({sample} sample): {len(bundle)} retained days, but {why} needs {need}")
+        path = bundle_file(Path(clean_dir), symbol, sample)
+        write_atomic(path, lambda p, b=bundle: b.to_parquet(p))
+        out[path.name] = sha256_file(path)
+    return out
+
+
+def task_marker(out_dir: Path, variant: str, symbol: str) -> Path:
+    return Path(out_dir) / f"{variant}__{symbol}.done.json"
+
+
+def task_done(out_dir: Path, variant: str, symbol: str) -> dict | None:
+    """The completion marker of a task if the task finished and its files are intact, else None."""
+    m = task_marker(out_dir, variant, symbol)
+    if not m.exists():
+        return None
+    info = json.loads(m.read_text())
+    if info["status"] == "ok":
+        for name, digest in info["files"].items():
+            f = Path(out_dir) / name
+            if not f.exists() or sha256_file(f) != digest:
+                return None
+    return info
+
+
+def save_task(res: WFResult, out_dir: Path, variant: str, symbol: str, seconds: float) -> dict:
+    out_dir = Path(out_dir)
+    files = {}
+    for name, df in (("forecasts", res.forecasts.reset_index()), ("regime", res.regime.reset_index()), ("counters", res.counters)):
+        p = out_dir / f"{variant}__{symbol}__{name}.parquet"
+        write_atomic(p, lambda q, d=df: d.to_parquet(q, index=False))
+        files[p.name] = sha256_file(p)
+    info = {"variant": variant, "symbol": symbol, "status": "ok", "files": files, "seconds": round(seconds, 1)}
+    write_atomic(task_marker(out_dir, variant, symbol), lambda q: q.write_text(json.dumps(info, indent=1)))
+    return info
+
+
+def save_stopped(out_dir: Path, variant: str, symbol: str, reason: str, seconds: float) -> dict:
+    info = {"variant": variant, "symbol": symbol, "status": "stopped", "reason": reason, "seconds": round(seconds, 1)}
+    write_atomic(task_marker(Path(out_dir), variant, symbol), lambda q: q.write_text(json.dumps(info, indent=1)))
+    return info
+
+
+def run_task(config_path: str, variant: str, symbol: str, clean_dir: str, out_dir: str) -> dict:
+    """One walk-forward run (one variant, one instrument), written to disk. Top-level so that a worker can import it."""
+    cfg = StudyConfig.from_json(Path(config_path))
+    daily = variant_daily(pd.read_parquet(bundle_file(Path(clean_dir), symbol, sample_of(variant))), variant)
+    setup = variant_setup(variant, cfg)
+    t0 = time.time()
+    try:
+        with single_thread():
+            res = run_walk_forward(daily, setup["factory"](), setup["wf"], setup["regime"])
+    except HmmFirstFitError as e:                          # PRESPEC 6: the instrument is stopped and reported
+        return save_stopped(Path(out_dir), variant, symbol, str(e), time.time() - t0)
+    return save_task(res, Path(out_dir), variant, symbol, time.time() - t0)
+
+
+def _pool(workers: int, fn: Callable, jobs: list[tuple], progress: Callable[[str], None], describe: Callable
+          ) -> tuple[list, list[tuple]]:
+    """Run fn(*job) for every job, in this process (workers <= 1) or in a pool. Returns (results, failures): the results of
+    the jobs that finished and the (job, error) pairs of those that failed."""
+    failures, results = [], []
+
+    def finished(job, result):
+        results.append(result)
+        extra = f" ({result['seconds']} s)" if isinstance(result, dict) and "seconds" in result else ""
+        progress(f"done: {describe(job)}{extra}")
+
+    def failed(job, e):
+        failures.append((job, repr(e)))
+        progress(f"FAILED: {describe(job)}: {e!r}")
+
+    if workers <= 1:
+        for job in jobs:
+            try:
+                finished(job, fn(*job))
+            except Exception as e:
+                failed(job, e)
+        return results, failures
+    limit_threads()
+    with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as ex:
+        futures = {ex.submit(fn, *job): job for job in jobs}
+        for f in as_completed(futures):
+            try:
+                finished(futures[f], f.result())
+            except Exception as e:
+                failed(futures[f], e)
+    return results, failures
+
+
+def prepare_all(cfg: StudyConfig, config_path: Path, clean_dir: Path, raw_dir: Path = RAW, workers: int = 1,
+                progress: Callable[[str], None] = print, only: list[str] | None = None) -> tuple[dict[str, str], list[tuple]]:
+    """
+    Stage 0: the daily bundles of every instrument (or of those named in `only`). Returns the SHA-256 of every bundle
+    file and the failures. Each job loads one whole raw file, so at most two run at the same time.
+    """
+    jobs = [(str(config_path), i.symbol, str(clean_dir), str(raw_dir)) for i in cfg.instruments if only is None or i.symbol in only]
+    results, failures = _pool(min(workers, 2), prepare_instrument, jobs, progress, lambda job: f"daily rows of {job[1]}")
+    hashes = {}
+    for r in results:
+        hashes.update(r)
+    return hashes, failures
+
+
+def execute_tasks(tasks: list[tuple[str, str]], config_path: Path, clean_dir: Path, out_dir: Path, workers: int = 1,
+                  progress: Callable[[str], None] = print) -> list[tuple]:
+    """Run the tasks that are not finished yet; returns the failures. Tasks already finished are skipped (resume)."""
+    todo = [(str(config_path), v, s, str(clean_dir), str(out_dir)) for v, s in tasks if task_done(out_dir, v, s) is None]
+    progress(f"{len(tasks) - len(todo)} of {len(tasks)} tasks are already finished; {len(todo)} to run, {max(workers, 1)} worker(s)")
+    return _pool(workers, run_task, todo, progress, lambda job: f"task {job[1]} / {job[2]}")[1]
+
+
+def load_variant_results(out_dir: Path, variant: str, symbols: list[str]) -> tuple[dict[str, WFResult], dict[str, str]]:
+    """The stored results of a variant: (results of the instruments that ran, reasons of those that were stopped)."""
+    results, stopped = {}, {}
+    for s in symbols:
+        info = task_done(out_dir, variant, s)
+        if info is None:
+            raise FileNotFoundError(f"task {variant} / {s} has no complete result in {out_dir}")
+        if info["status"] == "stopped":
+            stopped[s] = info["reason"]
+            continue
+        f = {k.split("__")[-1].replace(".parquet", ""): Path(out_dir) / k for k in info["files"]}
+        fc = pd.read_parquet(f["forecasts"]).set_index(["target_day", "model", "h"]).sort_index()
+        results[s] = WFResult(fc, pd.read_parquet(f["regime"]).set_index("origin"), pd.read_parquet(f["counters"]))
+    return results, stopped
 
 
 # ------------------------------------------------------------------------------------------------ evaluation
@@ -288,7 +525,7 @@ def evaluate_run(results: dict[str, WFResult], cfg: StudyConfig, families: dict 
         for s, t in tabs.items():
             r = results[s]
             mcs = E.model_confidence_set(t[_models(t)], size=cfg.mcs_size, reps=cfg.mcs_reps, block=cfg.mcs_block, seed=cfg.seed)
-            mcs_rows += [dict(h=h, instrument=s, model=m, mcs_pvalue=row.mcs_pvalue, included=bool(row.included))
+            mcs_rows += [dict(h=h, instrument=s, model=m, mcs_pvalue=row.mcs_pvalue, included=row.included, status=row.status)
                          for m, row in mcs.iterrows()]
             if r.regime is None or r.regime.empty:
                 continue
@@ -402,3 +639,38 @@ def make_figures(results: dict[str, WFResult], outdir: Path, prefix: str, a: str
     fig.savefig(paths[-1])
     plt.close(fig)
     return paths
+
+
+# ------------------------------------------------------------------------------------------------ evaluation of stored runs
+
+FIGURE_PAIRS = {"log_har": ("m5_log", "m3_log"), "harq": ("m5_q", "m3_q")}
+
+
+def variant_symbols(cfg: StudyConfig, variant: str) -> list[str]:
+    """The instruments a variant runs on: all of the panel, and for check 6 those with an own, longer history."""
+    return [i.symbol for i in cfg.instruments if variant != "long_history" or i.symbol in cfg.long_history]
+
+
+def evaluate_all(cfg: StudyConfig, out_dir: Path, tables_dir: Path, figures_dir: Path,
+                 progress: Callable[[str], None] = print) -> list[tuple[str, int, float]]:
+    """
+    Evaluate every variant from its stored task results: tables (CSV and LaTeX), figures, the instruments that were
+    stopped, and for the primary run the MSE-loss tables of robustness check 7. Returns (variant, instruments, seconds).
+    """
+    summary = []
+    for name in cfg.variants:
+        results, stopped = load_variant_results(out_dir, name, variant_symbols(cfg, name))
+        if stopped:                                          # PRESPEC 6: first HMM fit failed, instrument stopped
+            Path(tables_dir).mkdir(parents=True, exist_ok=True)
+            pd.DataFrame({"instrument": list(stopped), "reason": list(stopped.values())}).to_csv(
+                Path(tables_dir) / f"{name}__stopped_instruments.csv", index=False)
+        task_seconds = sum(task_done(out_dir, name, s)["seconds"] for s in variant_symbols(cfg, name))
+        if results:
+            setup = variant_setup(name, cfg)
+            write_tables(evaluate_run(results, cfg, families=setup["families"]), tables_dir, name)
+            make_figures(results, figures_dir, name, *FIGURE_PAIRS.get(name, ("m5", "m3")))
+            if name == "primary":                            # robustness check 7: the same forecasts under the MSE loss
+                write_tables(evaluate_run(results, cfg, loss="mse", pooled=False, extras=False, effects=False), tables_dir, "mse_loss")
+        summary.append((name, len(results), task_seconds))
+        progress(f"evaluated: {name} ({len(results)} instruments, {len(stopped)} stopped)")
+    return summary

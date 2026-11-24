@@ -30,6 +30,7 @@
   "window": 1000,
   "refit_every": 21,
   "burn_in": 22,
+  "alt_windows": [750, 1500],
   "horizons": [1, 5, 22],
   "min_ess": 100.0,
   "ms_starts": 10,

@@ -1,8 +1,9 @@
 """
 Run the study.
 
-    python src/run_study.py --dev                      # development: US500, first 1000 retained days only
-    python src/run_study.py --full --config FILE.json  # the one full run, on frozen code
+    python src/run_study.py --dev                                   # development: US500, first training window only
+    python src/run_study.py --full --config FILE.json [--workers N]  # the one full run, on frozen code
+    python src/run_study.py --full --config FILE.json --resume       # continue the same run after an interruption
 
 The full run refuses to start unless
   - PRESPEC.md is approved: its version is 1.0 or later, its status line no longer says DRAFT, the configuration
@@ -10,16 +11,25 @@ The full run refuses to start unless
     current one,
   - the working tree has no uncommitted change in tracked files (the commit hash goes into results/RUN_INFO.md),
   - the SHA-256 of every raw data file equals the one stored in results/raw_data_sha256.tsv,
-  - neither results/RUN_INFO.md nor results/RUN_STARTED.lock exists: the run happens once. If a run stopped half
-    way, look at what it wrote and remove the lock by hand.
+  - neither results/RUN_INFO.md nor results/RUN_STARTED.lock exists: the run happens once.
+
+The run has three stages. Stage 0 prepares the daily rows of every instrument (data/clean/); a data problem stops the
+run here, before the lock is written. Stage 1 runs one walk-forward task per (variant, instrument) in worker processes;
+every finished task is stored with a completion marker. Stage 2 evaluates the stored results and writes tables,
+figures and RUN_INFO.md. The result does not depend on the number of workers.
+
+If the run is interrupted (machine asleep, process killed), `--resume` continues it: it needs the lock, the same commit,
+the same configuration and the same PRESPEC.md, and it skips finished tasks. If the code has to change, the finished
+tasks are void: start again from an empty results/forecasts/ and no lock.
 Development mode writes to results/dev/ only, never touches data after the first training window and writes
 no RUN_INFO.md.
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.metadata as md
+import json
+import os
 import platform
 import re
 import subprocess
@@ -89,11 +99,7 @@ def git_state() -> tuple[str, list[str]]:
 
 
 def sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    return S.sha256_file(path)
 
 
 def verify_raw_hashes(symbols: list[str], raw_dir: Path = RAW, table: Path = RESULTS / "raw_data_sha256.tsv") -> dict[str, str]:
@@ -138,61 +144,102 @@ def run_dev() -> None:
     print(f"development outputs in {out.relative_to(ROOT)} (not results; nothing to interpret)")
 
 
-def run_full(config_path: Path) -> None:
+def make_logger(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(message: str) -> None:
+        line = f"{datetime.now():%Y-%m-%d %H:%M:%S}  {message}"
+        print(line, flush=True)
+        with open(path, "a") as f:
+            f.write(line + "\n")
+    return log
+
+
+def default_workers(n_tasks: int) -> int:
+    return max(1, min((os.cpu_count() or 2) - 2, n_tasks))
+
+
+def run_full(config_path: Path, workers: int | None = None, resume: bool = False, raw_dir: Path = RAW,
+             hash_table: Path | None = None) -> None:
     cfg = S.StudyConfig.from_json(config_path)
     version = check_prespec(ROOT / "PRESPEC.md", cfg.prespec_version, MINIMUM_VERSION)
     check_tag()
-    if (RESULTS / "RUN_INFO.md").exists() or (RESULTS / "RUN_STARTED.lock").exists():
-        raise SystemExit("REFUSED: the full run has been started before (results/RUN_INFO.md or RUN_STARTED.lock exists)")
+    lock, info = RESULTS / "RUN_STARTED.lock", RESULTS / "RUN_INFO.md"
+    if info.exists() or (lock.exists() and not resume):
+        raise SystemExit("REFUSED: the full run has been started before (results/RUN_INFO.md or RUN_STARTED.lock exists; "
+                         "--resume continues an interrupted run)")
+    if resume and not lock.exists():
+        raise SystemExit("REFUSED: nothing to resume (no results/RUN_STARTED.lock)")
     commit, dirty = git_state()
     if dirty:
         raise SystemExit("REFUSED: uncommitted changes in tracked files:\n  " + "\n  ".join(dirty))
     symbols = sorted({s.symbol for s in cfg.instruments})
-    hashes = verify_raw_hashes(symbols)
-    started = datetime.now(timezone.utc)
-    (RESULTS / "RUN_STARTED.lock").write_text(f"{started.isoformat()}\ncommit {commit}\n")
+    hashes = verify_raw_hashes(symbols, raw_dir, hash_table or RESULTS / "raw_data_sha256.tsv")
+    config_sha, prespec_sha = sha256(config_path), sha256(ROOT / "PRESPEC.md")
+    prior = {}
+    if resume:
+        try:
+            prior = json.loads(lock.read_text())
+        except ValueError:
+            raise SystemExit("REFUSED: results/RUN_STARTED.lock cannot be read")
+        for key, now, label in (("commit", commit, "commit"), ("config_sha256", config_sha, "configuration"),
+                                ("prespec_sha256", prespec_sha, "PRESPEC.md")):
+            if prior.get(key) != now:
+                raise SystemExit(f"REFUSED: the {label} is not the one the run was started with; a changed code base voids "
+                                 "the finished tasks, so start again from an empty results/forecasts/ and no lock")
+    log = make_logger(RESULTS / "run_progress.log")
+    clean_dir, out_dir = ROOT / "data" / "clean", RESULTS / "forecasts"
+    tasks = [(v, s) for v in cfg.variants for s in S.variant_symbols(cfg, v)]
+    workers = workers if workers is not None else default_workers(len(tasks))
+    started = datetime.fromisoformat(prior["started"]) if prior else datetime.now(timezone.utc)
     t0 = time.time()
-    summary = []
-    for name in cfg.variants:
-        specs = cfg.instruments
-        starts = {}
-        if name == "long_history":                              # check 6: each instrument on its own minute-data history
-            specs = [s for s in cfg.instruments if s.symbol in cfg.long_history]
-            starts = cfg.long_history
-        daily = {s.symbol: S.prepare_daily(s, name, start=starts.get(s.symbol)) for s in specs}
-        stopped: dict = {}
-        res = S.run_variant(name, cfg, daily, stopped=stopped)
-        if stopped:                                             # PRESPEC 6: first HMM fit failed, instrument stopped
-            (RESULTS / "tables").mkdir(parents=True, exist_ok=True)
-            pd.DataFrame({"instrument": list(stopped), "reason": list(stopped.values())}).to_csv(
-                RESULTS / "tables" / f"{name}__stopped_instruments.csv", index=False)
-        if not res:
-            continue
-        setup = S.variant_setup(name, cfg)
-        tables = S.evaluate_run(res, cfg, families=setup["families"])
-        S.write_tables(tables, RESULTS / "tables", name)
-        S.save_forecasts(res, RESULTS / "forecasts", name)
-        S.make_figures(res, RESULTS / "figures", name, *(("m5_log", "m3_log") if name == "log_har" else
-                                                          ("m5_q", "m3_q") if name == "harq" else ("m5", "m3")))
-        if name == "primary":                                   # robustness check 7: the same forecasts under the MSE loss
-            S.write_tables(S.evaluate_run(res, cfg, loss="mse", pooled=False, extras=False), RESULTS / "tables", "mse_loss")
-        summary.append((name, len(specs), round(time.time() - t0)))
-        print(f"done: {name} ({time.time() - t0:.0f} s)", flush=True)
-    write_run_info(cfg, version, commit, hashes, started, time.time() - t0, summary, config_path)
+
+    # stage 0: daily rows; a data problem stops the run here, before the lock exists
+    stored = prior.get("bundle_hashes", {})
+    have = {n: sha256(clean_dir / n) for n in stored if (clean_dir / n).exists()}
+    todo = [s for s in symbols if not all(n in have and have[n] == h for n, h in stored.items() if n.split("__")[1] == s)] \
+        if (resume and stored) else symbols
+    log(f"stage 0: daily rows of {', '.join(todo) if todo else 'no instrument (all present)'}")
+    new_hashes, failures = S.prepare_all(cfg, config_path, clean_dir, raw_dir, workers, log, only=todo) if todo else ({}, [])
+    if failures:
+        raise SystemExit("STOPPED in stage 0 (no lock written, nothing to undo): " + "; ".join(f"{j[1]}: {e}" for j, e in failures))
+    bundle_hashes = {**stored, **new_hashes}
+    if not resume:
+        lock.write_text(json.dumps({"started": started.isoformat(), "commit": commit, "config_sha256": config_sha,
+                                    "prespec_sha256": prespec_sha, "bundle_hashes": bundle_hashes}, indent=1))
+
+    # stage 1: one walk-forward task per (variant, instrument)
+    log(f"stage 1: {len(tasks)} tasks, {workers} worker(s)")
+    failures = S.execute_tasks(tasks, config_path, clean_dir, out_dir, workers, log)
+    if failures:
+        raise SystemExit(f"STOPPED: {len(failures)} task(s) failed ({'; '.join(f'{j[1]}/{j[2]}: {e}' for j, e in failures[:5])}). "
+                         "If the cause is outside the code (machine, memory), run again with --resume; the lock stays.")
+
+    # stage 2: evaluation of the stored results
+    log("stage 2: evaluation")
+    summary = S.evaluate_all(cfg, out_dir, RESULTS / "tables", RESULTS / "figures", log)
+    write_run_info(cfg, version, commit, hashes, started, time.time() - t0, summary, config_path,
+                   extra={"workers": workers, "bundle_hashes": bundle_hashes, "resumed": resume})
+    log("finished")
 
 
-def write_run_info(cfg, version, commit, hashes, started, seconds, summary, config_path) -> None:
+def write_run_info(cfg, version, commit, hashes, started, seconds, summary, config_path, extra: dict | None = None) -> None:
     versions = {p: md.version(p) for p in PACKAGES}
+    extra = extra or {}
     lines = ["# RUN_INFO", "",
              f"- Run started (UTC): {started:%Y-%m-%d %H:%M:%S}",
-             f"- Run time: {seconds / 60:.1f} minutes",
+             f"- Wall time of the last session: {seconds / 60:.1f} minutes"
+             + (f" ({extra['workers']} worker(s); the run was resumed)" if extra.get("resumed") else
+                f" ({extra['workers']} worker(s))" if "workers" in extra else ""),
              f"- Git commit of the frozen code: `{commit}`",
              f"- PRESPEC version: {version}",
              f"- Configuration file: `{config_path.name}` (SHA-256 {sha256(config_path)})",
              f"- Python {platform.python_version()} on {platform.platform()}", "",
              "## Package versions", "", *[f"- {k} {v}" for k, v in versions.items()], "",
              "## Raw data files (SHA-256, verified before the run)", "", *[f"- {k}  {v}" for k, v in hashes.items()], "",
-             "## Variants run", "", *[f"- {n}: {k} instruments, finished after {s} s" for n, k, s in summary], "",
+             *(["## Daily rows prepared from them (data/clean, SHA-256)", "", *[f"- {k}  {v}" for k, v in sorted(extra["bundle_hashes"].items())], ""]
+               if "bundle_hashes" in extra else []),
+             "## Variants run", "", *[f"- {n}: {k} instruments, task time {s:.0f} s" for n, k, s in summary], "",
              "## Configuration", "", "```json", cfg.to_json(), "```", ""]
     (RESULTS / "RUN_INFO.md").write_text("\n".join(lines))
     (RESULTS / "RUN_STARTED.lock").unlink(missing_ok=True)
@@ -205,13 +252,15 @@ def main() -> None:
     g.add_argument("--dev", action="store_true", help="development window of US500 only")
     g.add_argument("--full", action="store_true", help="the one full run (needs an approved PRESPEC.md)")
     ap.add_argument("--config", type=Path, help="study configuration (JSON), required with --full")
+    ap.add_argument("--workers", type=int, help="worker processes for --full (default: CPU count minus two)")
+    ap.add_argument("--resume", action="store_true", help="continue an interrupted full run")
     a = ap.parse_args()
     if a.dev:
         run_dev()
     else:
         if a.config is None:
             ap.error("--full needs --config")
-        run_full(a.config)
+        run_full(a.config, a.workers, a.resume)
 
 
 if __name__ == "__main__":

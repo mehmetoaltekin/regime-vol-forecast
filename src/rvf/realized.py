@@ -63,11 +63,15 @@ def excluded_mask(windows: tuple[tuple[int, int], ...]) -> np.ndarray:
     return mask
 
 
-def daily_measures(m1: pd.DataFrame, cfg: RVConfig = RVConfig()) -> pd.DataFrame:
+def daily_measures(m1: pd.DataFrame, cfg: RVConfig = RVConfig(), flags: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     m1: cleaned, time-sorted M1 bars with columns ts, open, high, low, close.
     Returns one row per trading day (index 'tday'). Short days are flagged in 'short' and carry NaN in the
     return-based columns; use `retained()` for the daily series the models see.
+
+    flags: boolean columns short, stale and anchor per trading day, taken from another run instead of being computed.
+    The alternative targets of the robustness checks use it so that they keep the main run's days: whichever days the
+    main run removed are removed, and a day the main run does not have counts as short.
     """
     if cfg.day_length not in ("span", "active"):
         raise ValueError("day_length must be 'span' or 'active'")
@@ -114,7 +118,9 @@ def daily_measures(m1: pd.DataFrame, cfg: RVConfig = RVConfig()) -> pd.DataFrame
 
     # short days
     length = out["n_returns"] if cfg.day_length == "span" else out["n_active"]
-    if cfg.short_day_share is None:
+    if flags is not None:
+        out["short"] = flags["short"].reindex(out.index).fillna(True).astype(bool)
+    elif cfg.short_day_share is None:
         out["short"] = False
     else:
         median = cfg.median_day_length if cfg.median_day_length is not None else float(length.median())
@@ -123,7 +129,9 @@ def daily_measures(m1: pd.DataFrame, cfg: RVConfig = RVConfig()) -> pd.DataFrame
     # stale days: one-minute returns between consecutive bars outside the excluded windows
     out["zero_share"] = np.nan
     out["stale"] = False
-    if cfg.stale_share is not None:
+    if flags is not None:
+        out["stale"] = flags["stale"].reindex(out.index).fillna(False).astype(bool)
+    elif cfg.stale_share is not None:
         ti, ci, di = ts.to_numpy()[inc], m1["close"].to_numpy(dtype=float)[inc], tday[inc]
         step = (np.diff(ti) == np.timedelta64(1, "m")) & (di[1:] == di[:-1])
         zero = step & (ci[1:] == ci[:-1])
@@ -135,7 +143,9 @@ def daily_measures(m1: pd.DataFrame, cfg: RVConfig = RVConfig()) -> pd.DataFrame
     # candidates are neither short nor stale; an anchor day follows a gap of more than anchor_gap_days
     cand = ~out["short"] & ~out["stale"]
     out["anchor"] = False
-    if cfg.anchor_gap_days is not None:
+    if flags is not None:
+        out["anchor"] = flags["anchor"].reindex(out.index).fillna(False).astype(bool)
+    elif cfg.anchor_gap_days is not None:
         cdates = pd.Series(out.index[cand], index=out.index[cand])
         out.loc[cdates.index[(cdates.diff().dt.days > cfg.anchor_gap_days).to_numpy()], "anchor"] = True
     keep = cand & ~out["anchor"]

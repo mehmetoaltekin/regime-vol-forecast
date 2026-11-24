@@ -173,12 +173,31 @@ def holm(pvalues) -> np.ndarray:
 
 def model_confidence_set(losses: pd.DataFrame, size: float = 0.10, reps: int = 10_000, block: int = 10,
                          seed: int = 0) -> pd.DataFrame:
-    """Hansen-Lunde-Nason MCS (range statistic, stationary bootstrap). Returns MCS p-values and inclusion per model."""
-    mcs = MCS(losses, size=size, reps=reps, block_size=block, method="R", bootstrap="stationary", seed=seed)
-    mcs.compute()
-    out = mcs.pvalues.rename(columns={"Pvalue": "mcs_pvalue"})
-    out["included"] = out.index.isin(mcs.included)
-    return out.reindex(losses.columns)
+    """
+    Hansen-Lunde-Nason MCS (range statistic, stationary bootstrap). Returns MCS p-values, inclusion and a status per
+    model. Models with exactly the same losses cannot be told apart (the test statistic is not defined for them): they
+    are run once and share the result of their representative; with a single distinct model all are included with
+    p-value 1. If arch cannot compute the set, the p-values are missing and the status says why.
+    """
+    unique = losses.T.drop_duplicates().T
+    out = pd.DataFrame(index=losses.columns, columns=["mcs_pvalue", "included", "status"], dtype=object)
+    if unique.shape[1] == 1:
+        out["mcs_pvalue"], out["included"], out["status"] = 1.0, True, "identical losses"
+        return out
+    try:
+        mcs = MCS(unique, size=size, reps=reps, block_size=block, method="R", bootstrap="stationary", seed=seed)
+        mcs.compute()
+    except Exception as e:                                    # a degenerate loss matrix must not stop the whole run
+        out["mcs_pvalue"], out["included"], out["status"] = np.nan, pd.NA, f"failed: {type(e).__name__}"
+        return out
+    res = mcs.pvalues["Pvalue"].reindex(unique.columns)
+    inc = pd.Series(unique.columns.isin(mcs.included), index=unique.columns)
+    for col in losses.columns:                                # a duplicate takes the result of its first twin
+        rep = next(u for u in unique.columns if np.array_equal(unique[u].to_numpy(), losses[col].to_numpy()))
+        out.loc[col, ["mcs_pvalue", "included"]] = [res[rep], bool(inc[rep])]
+        out.loc[col, "status"] = "ok" if rep == col else f"identical to {rep}"
+    out["mcs_pvalue"] = out["mcs_pvalue"].astype(float)
+    return out
 
 
 def gw_test(d, instruments, h: int = 1) -> dict:
@@ -199,6 +218,9 @@ def gw_test(d, instruments, h: int = 1) -> dict:
     for j in range(1, h):
         G = Z[j:].T @ Z[:-j] / n
         V += (1.0 - j / h) * (G + G.T)
+    if n < 2 * q or not np.isfinite(V).all() or np.linalg.cond(V) > 1e12:
+        # a constant-zero instrument (no regime variation) or identical forecasts: the statistic is not defined
+        return {"stat": np.nan, "pvalue": np.nan, "q": q, "n": n}
     stat = float(n * zbar @ np.linalg.solve(V, zbar))
     return {"stat": stat, "pvalue": float(stats.chi2(q).sf(stat)), "q": q, "n": n}
 

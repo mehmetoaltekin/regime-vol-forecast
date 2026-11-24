@@ -22,3 +22,4 @@ results/data_audit/
 results/forecasts/
 results/dev/
 results/RUN_STARTED.lock
+results/run_progress.log
