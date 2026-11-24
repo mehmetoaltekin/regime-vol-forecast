@@ -119,7 +119,9 @@ def verify_raw_hashes(symbols: list[str], raw_dir: Path = RAW, table: Path = RES
     return used
 
 
-DEV_START, DEV_END = "2017-03-21", "2021-02-04"       # PRESPEC 12.8: the first training window of US500
+# PRESPEC 12.8: the first training window of US500, 2017-03-22 to 2021-02-04. The minute data start on 2017-03-21, a day
+# without a return, so the first retained day is 2017-03-22.
+DEV_START, DEV_END = "2017-03-21", "2021-02-04"
 
 
 def dev_config() -> S.StudyConfig:

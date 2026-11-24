@@ -375,6 +375,13 @@ def test_run_info_is_written_through_write_atomic_and_a_failed_write_leaves_noth
     assert seen == ["RUN_INFO.md"] and "k" * 64 in (tmp_path / "RUN_INFO.md").read_text()
 
 
+def test_the_development_window_is_the_first_window_of_us500_of_prespec_12_8():
+    """The minute data of US500 start on 2017-03-21; that day has no return, so the retained days run from 2017-03-22 to 2021-02-04."""
+    assert (R.DEV_START, R.DEV_END) == ("2017-03-21", "2021-02-04")
+    spec = R.dev_config().instruments[0]
+    assert (spec.symbol, spec.start, spec.end) == ("US500", "2017-03-21", "2021-02-04")
+
+
 def test_development_mode_writes_only_below_results_dev():
     import inspect
     src = inspect.getsource(R.run_dev)
