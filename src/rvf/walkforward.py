@@ -80,6 +80,11 @@ def cumulative_target(y: np.ndarray, h: int) -> np.ndarray:
     return out
 
 
+def har_columns(y: pd.Series) -> pd.DataFrame:
+    """HAR regressors of day s from values up to s: the daily value and its 5- and 22-day averages."""
+    return pd.DataFrame({"har_d": y, "har_w": y.rolling(5).mean(), "har_m": y.rolling(22).mean()})
+
+
 def refit_origins(n: int, cfg: WFConfig) -> np.ndarray:
     """Row positions of the refit origins: the last day of the first window, then every `refit_every` days."""
     return np.arange(cfg.window - 1, n - 1, cfg.refit_every)
@@ -105,6 +110,7 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
         X = feats.to_numpy()
     else:
         data, X = daily, None
+    data = data.join(har_columns(data[cfg.target]))
     n = len(data)
     if n <= cfg.window:
         raise ValueError(f"{n} days are not enough for a window of {cfg.window}")
@@ -158,5 +164,8 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
 
     fc = pd.DataFrame(rows, columns=["target_day", "model", "h", "origin", "forecast", "raw", "target", "source"])
     regime = pd.DataFrame(regime_rows, columns=["origin", "prob_stress", "k", "refit"]).set_index("origin")
-    counters = pd.DataFrame([dict(model=m, h=h, **c) for (m, h), c in count.items()])
+    for m in models:                                            # model-specific counts, e.g. regimes that fell back
+        for (h, key), v in getattr(m, "extra_counts", {}).items():
+            count[(m.name, h)][key] = v
+    counters = pd.DataFrame([dict(model=m, h=h, **c) for (m, h), c in count.items()]).fillna(0)
     return WFResult(fc.set_index(["target_day", "model", "h"]).sort_index(), regime, counters, {"vintage_filt": vintage})
