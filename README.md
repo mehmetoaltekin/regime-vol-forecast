@@ -114,6 +114,13 @@ It writes the tables of the primary run and of the ten robustness checks to `res
 figures to `results/figures/` (PDF), the forecasts to `results/forecasts/` (parquet, git-ignored) and `results/RUN_INFO.md`
 (commit hash, run key, package versions, hashes of the raw data and of the prepared daily rows, run date, configuration).
 
+Every stored task has a regime table (`<variant>__<symbol>__regime.parquet`): `prob_stress` at each forecast origin, K, whether
+the HMM was refitted, converged or failed at that origin, and the diagnostics of the calibration in force (number and
+occupancy of the stress states, the log-likelihood and, per feature, how far the stress states' mean lies from the others',
+in standard deviations over the window). `<variant>__regime_summary` counts the failures, the non-converged refits and their
+warnings per refit and reports the share of refits in which the stress state differs more in the return than in the range
+(a split on the sign of the return rather than on volatility).
+
 Robustness check 6 (each instrument on its own longer minute-data history) is run for the four instruments that have one
 (`long_history` in the configuration: XAUUSD, EURUSD, USDJPY, GBPUSD). XAGUSD, whose history is unchanged, is not run again
 in that check, so its pooled test and Holm family cover four instruments.
