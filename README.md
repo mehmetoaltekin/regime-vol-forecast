@@ -96,9 +96,11 @@ If something goes wrong:
   `results/figures/`. Move them out of `results/`.
 - Both `results/RUN_INFO.md` and `results/RUN_STARTED.lock` exist: the run finished, and the process was stopped between
   writing `RUN_INFO.md` and removing the lock. Nothing is left to do; delete the lock.
-- Stage 2 stopped (an error or a kill), the lock exists and `RUN_INFO.md` does not: run `--resume`; the tasks are
-  finished, so only stage 2 runs again. `RUN_INFO.md` and the lock are written through a temporary file, so a kill cannot
-  leave a half-written one.
+- Stage 2 stopped (an error or a kill), the lock exists and `RUN_INFO.md` does not: if the cause is outside the code (a
+  kill, a full disk), run `--resume`; the tasks are finished, so only stage 2 runs again. A fix in the code is a new
+  commit, and `--resume` then refuses ("the commit is not the one the run was started with"): the finished tasks belong
+  to the old commit, so the run starts again as described above. `RUN_INFO.md` and the lock are written through a
+  temporary file, so a kill cannot leave a half-written one.
 - A task marker (`results/forecasts/*.done.json`) that is empty or damaged counts as an unfinished task: `--resume`
   computes that task again.
 
@@ -129,7 +131,7 @@ in that check, so its pooled test and Holm family cover four instruments.
 
 | path | content |
 |---|---|
-| `config/study_config.json` | every number of the pre-specification that the code needs |
+| `config/study_config.json` | the study design as the code reads it from a file: instruments, sample, RV and cleaning rules, window, refit, burn-in, horizons, MCS and variant settings (constants such as the EWMA decay 0.94, K = 2 and the 0.5 stress threshold are in the code) |
 | `pyproject.toml`, `uv.lock` | the pinned package versions |
 | `src/rvf/data.py` | M1 loader, bar-level cleaning, bounce-back filter |
 | `src/rvf/realized.py` | realised variance and quarticity, range estimators, daily returns, day-level rules |
