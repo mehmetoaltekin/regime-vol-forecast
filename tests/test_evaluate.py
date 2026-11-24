@@ -68,6 +68,8 @@ def test_holm_adjustment():
     assert np.allclose(E.holm([0.01, 0.04, 0.03]), [0.03, 0.06, 0.06])
     assert np.allclose(E.holm([0.5, 0.9]), [1.0, 1.0])
     assert np.allclose(E.holm([0.02]), [0.02])
+    with pytest.raises(ValueError):
+        E.holm([0.02, np.nan])
 
 
 def test_model_confidence_set_drops_a_clearly_worse_model():
@@ -100,7 +102,7 @@ def test_gw_test_formula_and_power():
 
 
 def test_regime_masks_and_loss_splits():
-    idx = pd.bdate_range("2023-12-01", periods=60)
+    idx = pd.bdate_range("2023-12-01", periods=60, name="target_day")
     p = pd.Series(0.1, index=idx)
     p.iloc[30:40] = 0.9                                                # stress from forecast 30 to 39
     masks = E.regime_masks(p, halfwidth=3)
@@ -112,6 +114,27 @@ def test_regime_masks_and_loss_splits():
     assert out.loc["transition", "n"] == 14 and out.loc["transition", "a"] == pytest.approx(35.0)
     assert out.loc["2023", "n"] == (idx.year == 2023).sum() and out.loc["2024", "a"] == pytest.approx(losses["a"][idx.year == 2024].mean())
     assert (out["b"] == 1.0).all()
+    with pytest.raises(ValueError):                                    # indexed by origin, not by target day
+        E.loss_splits(losses, p.rename_axis("origin"))
+    with pytest.raises(ValueError):
+        E.loss_splits(losses, p.iloc[:-1])
+    with pytest.raises(ValueError):
+        E.regime_masks(p.where(p.index != idx[5]))
+
+
+def test_conditioning_variables_are_taken_at_the_forecast_origin():
+    days = pd.bdate_range("2024-01-01", periods=6)
+    rows = [(days[i + 1], m, 1, days[i], 1.0, 1.0 if i < 4 else np.nan) for i in range(5) for m in ("m3", "m5")]
+    fc = pd.DataFrame(rows, columns=["target_day", "model", "h", "origin", "forecast", "target"]).set_index(["target_day", "model", "h"])
+    p_origin = pd.Series([0.1, 0.9, 0.2, 0.8, 0.3, 0.7], index=days.rename("origin"), name="prob_stress")
+    p = E.at_origin(fc, p_origin)
+    assert p.index.name == "target_day" and list(p.index) == list(days[1:5])       # the forecast without a target is left out
+    assert list(p) == [0.1, 0.9, 0.2, 0.8]                                         # target day d gets p of the day before
+    losses = E.loss_table(fc)
+    out = E.loss_splits(losses, p, halfwidth=0)
+    assert out.loc["stress", "n"] == 2 and out.loc["calm", "n"] == 2
+    with pytest.raises(ValueError):
+        E.at_origin(fc, p_origin.iloc[1:])                                         # an origin without a value
 
 
 def test_loss_table_from_walk_forward_output():
@@ -122,3 +145,7 @@ def test_loss_table_from_walk_forward_output():
     assert list(tab.index) == list(days[:2]) and list(tab.columns) == ["m3", "m5"]      # the day without a target is dropped
     assert tab.loc[days[1], "m3"] == pytest.approx(0.0) and tab.loc[days[1], "m5"] == pytest.approx(2 - np.log(2) - 1)
     assert E.loss_table(fc, 1, "mse").loc[days[0], "m3"] == pytest.approx(1.0)
+    bad = fc.copy()
+    bad.loc[(days[0], "m5", 1), "forecast"] = -1.0                     # a non-positive forecast has no QLIKE
+    with pytest.raises(ValueError, match="non-finite"):
+        E.loss_table(bad, 1, "qlike")

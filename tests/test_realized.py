@@ -104,6 +104,38 @@ def test_excluded_window_moves_go_into_the_session_break_return():
     assert d_step["n_returns"] == d_none["n_returns"] - 3
 
 
+def test_window_holding_the_last_bar_of_the_day():
+    minutes = np.arange(1440)
+    days = pd.bdate_range("2024-01-01", periods=4)
+    close = np.full((4, 1440), 100.0)
+    close[1, 1435:] = 99.0                                                         # a dip in 23:55-23:59 on day 2
+    close[3, 1435:] = 98.0                                                         # and on day 4
+    m1 = bars(days, minutes, close.ravel())
+    cfg = dict(excluded_windows=((1435, 5),), short_day_share=None)
+    literal = daily_measures(m1, RVConfig(**cfg))
+    # daily close from all bars: the dip is in the close-to-close return and so in the session-break return
+    assert literal.loc[days[1], "close"] == 99.0 and literal.loc[days[1], "rv"] == pytest.approx((100 * np.log(0.99)) ** 2)
+    assert literal.loc[days[2], "rv"] == pytest.approx((100 * np.log(0.99)) ** 2)   # and comes back the next day
+    inside = daily_measures(m1, RVConfig(ohlc_from_included=True, **cfg))
+    # daily open, high, low and close from the bars outside the window: the dip is gone from every measure
+    assert (inside["close"] == 100.0).all() and (inside["low"] == 100.0).all()
+    assert np.allclose(inside["rv"].iloc[1:], 0.0) and np.allclose(inside["parkinson"], 0.0)
+    assert (inside["bars"] == 1440).all()
+
+
+def test_default_median_depends_on_the_sample_given():
+    short_sessions, _ = brownian(15, 1.0, minutes=np.arange(480, 1080), seed=8)                    # 10-hour days
+    long_sessions, _ = brownian(25, 1.0, seed=9, start="2024-02-01")                               # 24-hour days
+    early_only = daily_measures(short_sessions, RVConfig())
+    both = daily_measures(pd.concat([short_sessions, long_sessions], ignore_index=True), RVConfig())
+    assert not early_only["short"].any()
+    assert both["short"].iloc[:15].all()                                           # later data changed the early days
+    fixed = RVConfig(median_day_length=119.0)                                      # a median fixed in advance does not
+    a = daily_measures(short_sessions, fixed)
+    b = daily_measures(pd.concat([short_sessions, long_sessions], ignore_index=True), fixed)
+    assert a["short"].equals(b["short"].iloc[:15]) and not a["short"].any()
+
+
 def test_session_break_can_be_left_out():
     m1, _ = brownian(5, 1.0, seed=2)
     m1["close"] = m1["close"] * np.where(m1["ts"].dt.normalize() >= pd.Timestamp("2024-01-03"), 1.05, 1.0)   # overnight gap

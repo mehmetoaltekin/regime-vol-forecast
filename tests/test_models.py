@@ -7,7 +7,7 @@ import rvf.models as M
 from rvf.regime import RegimeConfig
 from rvf.walkforward import WFConfig, Window, cumulative_target, har_columns, run_walk_forward
 
-from conftest import make_daily
+from conftest import make_daily, perturb_after
 
 
 def window(y, r=None, filt=None, A=None, stress=None, state_var=None, n_train=None) -> Window:
@@ -217,9 +217,7 @@ def test_no_model_looks_ahead():
     cfg = WFConfig(window=200, refit_every=60, horizons=(1, 5))
     regime = RegimeConfig(n_init=2)
     cut = 261                                                # daily row 260 is a refit origin (the first row has no feature)
-    changed = daily.copy()
-    changed.iloc[cut:, changed.columns.get_indexer(["open", "high", "low", "close"])] *= 1.25
-    changed.iloc[cut:, changed.columns.get_indexer(["rv", "r_cc"])] *= 3.0
+    changed = perturb_after(daily, cut)                      # every input changes, highs and lows independently
     a = run_walk_forward(daily, M.all_models(min_ess=20, ms_starts=1), cfg, regime)
     b = run_walk_forward(changed, M.all_models(min_ess=20, ms_starts=1), cfg, regime)
     last_clean = daily.index[cut - 1]
@@ -234,3 +232,7 @@ def test_no_model_looks_ahead():
         x = a.forecasts[after].xs(name, level="model")["raw"]
         y = b.forecasts[after].xs(name, level="model")["raw"]
         assert not np.allclose(x, y), name                   # the perturbation does reach every model afterwards
+    # a sample that ends at the cut gives the same forecasts for the origins it contains
+    short = run_walk_forward(daily.iloc[:cut], M.all_models(min_ess=20, ms_starts=1), cfg, regime)
+    pd.testing.assert_frame_equal(short.forecasts[["forecast", "raw", "source"]],
+                                  fa.loc[short.forecasts.index, ["forecast", "raw", "source"]])

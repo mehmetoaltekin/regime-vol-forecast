@@ -93,7 +93,7 @@ def refit_origins(n: int, cfg: WFConfig) -> np.ndarray:
 @dataclass
 class WFResult:
     forecasts: pd.DataFrame                   # index (target_day, model); columns h, origin, forecast, raw, target, source
-    regime: pd.DataFrame                      # per origin: real-time prob_stress, K, refit flag
+    regime: pd.DataFrame                      # per origin: real-time prob_stress, K, refit flag, HMM fit status
     counters: pd.DataFrame                    # per model and horizon: refits, failures, fallbacks, insanity replacements
     details: dict = field(default_factory=dict)
 
@@ -117,6 +117,9 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
     y = data[cfg.target].to_numpy(dtype=float)
     refits = set(refit_origins(n, cfg).tolist())
     names = [m.name for m in models]
+    used = [m.name for m in models if getattr(m, "est", None) or getattr(m, "extra_counts", None)]
+    if used:
+        raise ValueError(f"models already hold estimates from another run, build new ones: {used}")
     by_name = dict(zip(names, models))
     count = {(m, h): dict(refits=0, failures=0, fallbacks=0, insane=0) for m in names for h in cfg.horizons}
     rows, regime_rows, vintage = [], [], {}
@@ -134,7 +137,8 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
         win = Window(data.iloc[anchor: t + 1], cfg.window, filt, *(
             (cal.A, cal.stress, cal.state_var) if cal is not None else (None, None, None)), cfg.target)
         if regime_cfg is not None:
-            regime_rows.append((data.index[t], float(win.p[-1]), cal.k, refit))
+            regime_rows.append((data.index[t], float(win.p[-1]), cal.k, refit, bool(cal.model.converged_),
+                                len(cal.model.warnings_)))
             vintage[data.index[t]] = filt[-1].copy()            # filtered vector as computed on day t
 
         for h in cfg.horizons:
@@ -163,7 +167,8 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
                 rows.append((data.index[t + 1], m.name, h, data.index[t], final, f, target, source))
 
     fc = pd.DataFrame(rows, columns=["target_day", "model", "h", "origin", "forecast", "raw", "target", "source"])
-    regime = pd.DataFrame(regime_rows, columns=["origin", "prob_stress", "k", "refit"]).set_index("origin")
+    regime = pd.DataFrame(regime_rows, columns=["origin", "prob_stress", "k", "refit", "hmm_converged", "hmm_warnings"]
+                          ).set_index("origin")
     for m in models:                                            # model-specific counts, e.g. regimes that fell back
         for (h, key), v in getattr(m, "extra_counts", {}).items():
             count[(m.name, h)][key] = v

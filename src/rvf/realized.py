@@ -12,7 +12,8 @@ Definitions (server time; returns in percent, variances in percent squared):
   session-break   One return per day that collects everything the grid returns do not cover: the move from the
   return          previous retained day's last close to the day's first grid price, and the price change across
                   excluded windows. By construction: sum of grid returns + session-break return = close-to-close
-                  return, where the close is the last M1 close of the server day (all bars).
+                  return, where the close is the last M1 close of the server day (all bars, or only the bars
+                  outside the excluded windows if ohlc_from_included).
   RV              Sum of squared grid returns, plus the squared session-break return if include_session_break.
   RQ              Realised quarticity (n / 3) * sum of fourth powers of the n grid returns.
   short day       A day whose number of grid returns is below short_day_share times the median day length. Short
@@ -36,7 +37,9 @@ class RVConfig:
     merge_sunday: bool = True
     short_day_share: float | None = 0.5                  # None: no day is removed
     day_length: str = "span"                             # "span": grid returns per day; "active": intervals with a bar
-    median_day_length: float | None = None               # fixed in advance; None: median of the sample given
+    median_day_length: float | None = None               # fixed in advance; None: median of the sample given,
+                                                         # which makes early days depend on later data
+    ohlc_from_included: bool = False                     # True: daily open/high/low/close ignore excluded windows
 
 
 def excluded_mask(windows: tuple[tuple[int, int], ...]) -> np.ndarray:
@@ -70,14 +73,18 @@ def daily_measures(m1: pd.DataFrame, cfg: RVConfig = RVConfig()) -> pd.DataFrame
     tday = day + np.where(is_sun, np.timedelta64(1, "D"), np.timedelta64(0, "D"))
     m = mod - MIN_PER_DAY * is_sun                          # minutes since the trading day's 00:00; negative on Sunday
 
-    # daily OHLC from all bars of the server day
-    g = pd.DataFrame({"tday": tday, "open": m1["open"].to_numpy(), "high": m1["high"].to_numpy(),
-                      "low": m1["low"].to_numpy(), "close": m1["close"].to_numpy()}).groupby("tday", sort=True)
-    out = g.agg(open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"), bars=("close", "size"))
-
-    # grid prices: last included close per (trading day, segment, grid point)
     excl = excluded_mask(cfg.excluded_windows)
     inc = ~excl[mod]
+
+    # daily OHLC from all bars of the server day, or from the bars outside the excluded windows
+    use = inc if cfg.ohlc_from_included else np.ones(len(m1), dtype=bool)
+    g = pd.DataFrame({"tday": tday, "open": m1["open"].to_numpy(), "high": m1["high"].to_numpy(),
+                      "low": m1["low"].to_numpy(), "close": m1["close"].to_numpy()})
+    out = g[use].groupby("tday", sort=True).agg(open=("open", "first"), high=("high", "max"), low=("low", "min"),
+                                                 close=("close", "last"))
+    out["bars"] = g.groupby("tday").size().reindex(out.index)
+
+    # grid prices: last included close per (trading day, segment, grid point)
     seg_of = np.cumsum(np.tile(excl, 2))                    # constant between excluded minutes, over [-1440, 1440)
     T, S = tday[inc], seg_of[m[inc] + MIN_PER_DAY]
     K = (m[inc] + cfg.interval_min) // cfg.interval_min     # ceil of the close time (m + 1) on the grid

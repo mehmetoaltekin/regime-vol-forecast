@@ -25,6 +25,21 @@ def make_daily(n=420, seed=0, start="2015-01-01") -> pd.DataFrame:
     return d
 
 
+def perturb_after(daily: pd.DataFrame, cut: int, seed: int = 99) -> pd.DataFrame:
+    """Rows from position `cut` on get new closes, independent highs and lows, new returns and scaled variances."""
+    rng = np.random.default_rng(seed)
+    out = daily.copy()
+    n = len(out) - cut
+    close = out["close"].iloc[cut - 1] * np.exp(np.cumsum(rng.normal(0, 0.03, n)))
+    open_ = close * np.exp(rng.normal(0, 0.01, n))
+    hi = np.maximum(open_, close) * np.exp(np.abs(rng.normal(0, 0.02, n)))
+    lo = np.minimum(open_, close) * np.exp(-np.abs(rng.normal(0, 0.02, n)))
+    for col, val in (("open", open_), ("high", hi), ("low", lo), ("close", close), ("r_cc", rng.normal(0, 3, n)),
+                     ("rv", out["rv"].to_numpy()[cut:] * rng.uniform(2, 9, n))):
+        out.iloc[cut:, out.columns.get_loc(col)] = val
+    return out
+
+
 @pytest.fixture(scope="session")
 def daily():
     return make_daily()

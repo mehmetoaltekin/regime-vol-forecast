@@ -7,6 +7,8 @@ from hmm_regime import prepare_hmm_features
 from rvf.regime import RegimeCalibration, RegimeConfig, ahead, hmm_features, prob_stress
 from rvf.walkforward import WFConfig, Window, cumulative_target, refit_origins, run_walk_forward
 
+from conftest import perturb_after
+
 FAST = RegimeConfig(n_init=2)
 WF = WFConfig(window=150, refit_every=40)
 
@@ -58,10 +60,8 @@ def test_features_match_the_library(daily):
 
 
 def test_features_and_filter_do_not_look_ahead(daily):
-    changed = daily.copy()
     cut = 300
-    changed.iloc[cut:, changed.columns.get_indexer(["open", "high", "low", "close"])] *= 1.3
-    changed.iloc[cut:, changed.columns.get_loc("rv")] *= 4.0
+    changed = perturb_after(daily, cut)                                        # high, low and close change independently
     for cfg in (RegimeConfig(), RegimeConfig(vol_feature="rolling"), RegimeConfig(feature_cols=("log_return", "log_rv"))):
         a, b = hmm_features(daily, cfg), hmm_features(changed, cfg)
         assert a.loc[: daily.index[cut - 1]].equals(b.loc[: daily.index[cut - 1]])
@@ -70,6 +70,10 @@ def test_features_and_filter_do_not_look_ahead(daily):
     k = cut - 1                                                              # feature rows start one day late
     assert np.array_equal(cal.filter(X)[:k], cal.filter(Xc)[:k])
     assert not np.allclose(cal.filter(X)[k:], cal.filter(Xc)[k:])
+    assert not np.allclose(X[k:, 1], Xc[k:, 1])                               # the range feature itself was changed
+    # the same holds for a sample that simply ends at the cut
+    for cfg in (RegimeConfig(), RegimeConfig(vol_feature="rolling")):
+        assert hmm_features(daily.iloc[:cut], cfg).equals(hmm_features(daily, cfg).loc[: daily.index[cut - 1]])
 
 
 def test_filter_can_be_continued_one_day_at_a_time(daily):
@@ -123,9 +127,7 @@ def test_calendar_and_what_models_are_shown(daily):
 
 def test_forecasts_do_not_depend_on_later_data(daily):
     cut = 330
-    changed = daily.copy()
-    changed.iloc[cut:, changed.columns.get_indexer(["open", "high", "low", "close"])] *= 1.2
-    changed.iloc[cut:, changed.columns.get_loc("rv")] *= 5.0
+    changed = perturb_after(daily, cut)
     a = run_walk_forward(daily, [LastValue(), UsesRegime()], WF, FAST)
     b = run_walk_forward(changed, [LastValue(), UsesRegime()], WF, FAST)
     last_clean_origin = daily.index[cut - 1]
@@ -136,6 +138,12 @@ def test_forecasts_do_not_depend_on_later_data(daily):
     pd.testing.assert_frame_equal(a.regime.loc[:last_clean_origin], b.regime.loc[:last_clean_origin])
     later = a.forecasts["origin"] > daily.index[cut + 45]                    # after the next refit everything differs
     assert not np.allclose(a.forecasts.loc[later, "forecast"], b.forecasts.loc[later, "forecast"])
+    # a sample that ends at the cut gives the same forecasts for the origins it contains
+    short = run_walk_forward(daily.iloc[:cut], [LastValue(), UsesRegime()], WF, FAST)
+    pd.testing.assert_frame_equal(short.forecasts[["forecast", "raw", "origin"]],
+                                  fa.loc[short.forecasts.index, ["forecast", "raw", "origin"]])
+    pd.testing.assert_frame_equal(short.regime, a.regime.loc[short.regime.index])
+    assert a.regime["hmm_converged"].all() and (a.regime["hmm_warnings"] == 0).all()
 
 
 def test_vintage_is_the_probability_computed_on_the_day(daily):
@@ -184,3 +192,11 @@ def test_insanity_filter_and_fallback_are_counted(daily):
 def test_too_little_data_is_an_error(daily):
     with pytest.raises(ValueError):
         run_walk_forward(daily.iloc[:100], [LastValue()], WF, None)
+
+
+def test_models_from_an_earlier_run_are_refused(daily):
+    from rvf.models import Ewma, Har
+    models = [Ewma(), Har()]
+    run_walk_forward(daily, models, WF, None)
+    with pytest.raises(ValueError, match="already hold estimates"):
+        run_walk_forward(daily, models, WF, None)

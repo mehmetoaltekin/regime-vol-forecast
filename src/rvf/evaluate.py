@@ -15,7 +15,8 @@ from scipy import stats
 def qlike(rv, f):
     """QLIKE loss RV/f - log(RV/f) - 1 (Patton 2011); zero when the forecast equals the outcome."""
     ratio = np.asarray(rv, dtype=float) / np.asarray(f, dtype=float)
-    return ratio - np.log(ratio) - 1.0
+    with np.errstate(invalid="ignore", divide="ignore"):      # a non-positive ratio gives NaN or inf; callers check
+        return ratio - np.log(ratio) - 1.0
 
 
 def mse(rv, f):
@@ -30,7 +31,26 @@ def loss_table(forecasts: pd.DataFrame, h: int = 1, loss: str = "qlike") -> pd.D
     fc = forecasts.xs(h, level="h")
     fc = fc[fc["target"].notna()]
     out = pd.Series(LOSSES[loss](fc["target"], fc["forecast"]), index=fc.index).unstack("model")
-    return out.dropna()
+    bad = ~np.isfinite(out.to_numpy())
+    if bad.any():
+        raise ValueError(f"{int(bad.sum())} non-finite {loss} losses (forecast or target not positive, or a model "
+                         "without a forecast for a day)")
+    return out
+
+
+def at_origin(forecasts: pd.DataFrame, by_origin: pd.Series, h: int = 1) -> pd.Series:
+    """
+    A series indexed by forecast origin (for example WFResult.regime["prob_stress"]) -> the same values indexed by
+    the target day of the horizon-h forecasts made at that origin. Use this before `loss_splits` and `gw_test`:
+    conditioning variables must be the ones known when the forecast was made.
+    """
+    fc = forecasts.xs(h, level="h")
+    fc = fc[fc["target"].notna()]
+    origin = fc.groupby(level="target_day")["origin"].first()
+    out = pd.Series(by_origin.reindex(origin.to_numpy()).to_numpy(), index=origin.index, name=by_origin.name)
+    if out.isna().any():
+        raise ValueError("no value for some forecast origins")
+    return out
 
 
 def default_lag(h: int) -> int:
@@ -95,6 +115,8 @@ def pooled_dm(d: pd.DataFrame, h: int = 1, alternative: str = "two-sided") -> di
 def holm(pvalues) -> np.ndarray:
     """Holm step-down adjusted p-values, in the order given."""
     p = np.asarray(pvalues, dtype=float)
+    if not np.isfinite(p).all():
+        raise ValueError("p-values must be finite")
     m = len(p)
     order = np.argsort(p)
     adj = np.maximum.accumulate((m - np.arange(m)) * p[order])
@@ -137,10 +159,12 @@ def gw_test(d, instruments, h: int = 1) -> dict:
 
 def regime_masks(p: pd.Series, threshold: float = 0.5, halfwidth: int = 10) -> pd.DataFrame:
     """
-    p: prob_stress known at the forecast origin, one value per forecast in time order.
+    p: prob_stress known at the forecast origin, one value per forecast in time order (see `at_origin`).
     stress: p > threshold; calm: p <= threshold; transition: within `halfwidth` forecasts of a crossing of the
     threshold (the crossing is the first forecast on the new side).
     """
+    if p.isna().any():
+        raise ValueError("prob_stress has missing values")
     stress = (p > threshold).to_numpy()
     cross = np.flatnonzero(stress[1:] != stress[:-1]) + 1
     near = np.zeros(len(p), dtype=bool)
@@ -150,8 +174,12 @@ def regime_masks(p: pd.Series, threshold: float = 0.5, halfwidth: int = 10) -> p
 
 
 def loss_splits(losses: pd.DataFrame, p: pd.Series, threshold: float = 0.5, halfwidth: int = 10) -> pd.DataFrame:
-    """Mean loss per model for all days, stress days, calm days, transition windows and each calendar year."""
-    p = p.reindex(losses.index)
+    """
+    Mean loss per model for all days, stress days, calm days, transition windows and each calendar year.
+    p must be indexed by target day and hold prob_stress of the forecast origin: build it with `at_origin`.
+    """
+    if p.index.name != "target_day" or not p.index.equals(losses.index):
+        raise ValueError("p must come from at_origin() and cover exactly the days of the loss table")
     masks = regime_masks(p, threshold, halfwidth)
     parts = {"all": np.ones(len(losses), dtype=bool), **{c: masks[c].to_numpy() for c in masks}}
     for y in sorted(set(losses.index.year)):
