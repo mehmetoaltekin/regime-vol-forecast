@@ -212,9 +212,12 @@ def test_mean_losses_come_from_the_horizons_own_forecasts(panel):
     for h in HORIZONS:
         for sym in STARTS:
             losses = panel.truth[(sym, h)][0]
+            fc = panel.results[sym].forecasts.xs(h, level="h")
+            mse = ((fc["forecast"] - fc["target"]) ** 2).groupby(level="model").mean()      # the other loss, from the plain forecasts
             for m in MODELS:
                 row = pick(ml, h=h, instrument=sym, model=m)
                 assert row["mean_loss"] == pytest.approx(losses[m].mean(), rel=1e-10) and row["n"] == len(losses)
+                assert row["mean_other"] == pytest.approx(mse[m], rel=1e-10) and row["loss"] == "qlike"
 
 
 # ------------------------------------------------------------------------------------------------ pooled tests and effect sizes
