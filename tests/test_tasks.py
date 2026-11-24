@@ -283,3 +283,29 @@ def test_mcs_and_giacomini_white_survive_identical_models_and_a_constant_instrum
     g = E.gw_test(rng.normal(0, 1, n), np.column_stack([np.ones(n), np.zeros(n)]))
     assert np.isnan(g["stat"]) and np.isnan(g["pvalue"]) and g["q"] == 2 and g["n"] == n
     assert not np.isnan(E.gw_test(rng.normal(0, 1, n), np.column_stack([np.ones(n), rng.uniform(size=n)]))["stat"])
+
+
+# ------------------------------------------------------------------------------------------ descriptive statistics
+
+def test_descriptive_tables_and_the_log_rv_correlation_matrix():
+    from scipy import stats
+    a = make_daily(300, seed=1)
+    b = make_daily(260, seed=2, start="2015-02-02")                                     # a shorter, later sample
+    c = make_daily(280, seed=3)
+    out = S.descriptive_tables({"AAA": a, "BBB": b, "CCC": c})
+    desc = out["descriptive_statistics"]
+    assert list(desc.columns[:5]) == ["instrument", "variable", "n", "first", "last"] and len(desc) == 9
+    row = desc[(desc["instrument"] == "AAA") & (desc["variable"] == "log RV")].iloc[0]
+    x = np.log(a["rv"])
+    assert row["n"] == 300 and row["mean"] == pytest.approx(x.mean()) and row["sd"] == pytest.approx(x.std(ddof=1))
+    assert row["skewness"] == pytest.approx(stats.skew(x, bias=False)) and row["excess_kurtosis"] == pytest.approx(stats.kurtosis(x, bias=False))
+    assert row["acf1"] == pytest.approx(np.corrcoef(x[1:], x[:-1])[0, 1]) and row["acf22"] == pytest.approx(np.corrcoef(x[22:], x[:-22])[0, 1])
+    assert row["first"] == a.index[0] and row["last"] == a.index[-1]
+    ret = desc[(desc["instrument"] == "BBB") & (desc["variable"] == "return (%)")].iloc[0]
+    assert ret["mean"] == pytest.approx(b["r_cc"].mean()) and ret["min"] == b["r_cc"].min() and ret["max"] == b["r_cc"].max()
+    corr = out["correlation_log_rv"].set_index("instrument")
+    common = pd.DataFrame({k: np.log(v["rv"]) for k, v in {"AAA": a, "BBB": b, "CCC": c}.items()}).dropna()      # days all three have
+    assert np.allclose(corr.to_numpy(), np.corrcoef(common.to_numpy().T)) and list(corr.index) == ["AAA", "BBB", "CCC"]
+    sample = out["correlation_log_rv_sample"].iloc[0]
+    assert sample["common_days"] == len(common) == 258                                   # 2 February (day 22) to day 279 of the others
+    assert sample["first"] == common.index[0] and sample["last"] == common.index[-1]

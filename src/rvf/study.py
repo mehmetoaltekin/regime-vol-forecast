@@ -651,13 +651,41 @@ def variant_symbols(cfg: StudyConfig, variant: str) -> list[str]:
     return [i.symbol for i in cfg.instruments if variant != "long_history" or i.symbol in cfg.long_history]
 
 
+def descriptive_tables(bundles: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """
+    Descriptive statistics of the daily series of each instrument (the retained days of its sample, burn-in included)
+    and the correlation matrix of daily log RV across the instruments on the days they all have.
+
+    Per instrument and variable (daily return in percent, RV in percent squared, log RV): number of days, first and last
+    day, mean, standard deviation, minimum, median, maximum, skewness and excess kurtosis (pandas definitions, bias
+    corrected) and the autocorrelations at lags 1, 5 and 22.
+    """
+    rows = []
+    for sym, d in bundles.items():
+        for name, x in (("return (%)", d["r_cc"]), ("RV (%^2)", d["rv"]), ("log RV", np.log(d["rv"]))):
+            rows.append(dict(instrument=sym, variable=name, n=int(x.notna().sum()), first=d.index[0], last=d.index[-1],
+                             mean=x.mean(), sd=x.std(), min=x.min(), median=x.median(), max=x.max(), skewness=x.skew(),
+                             excess_kurtosis=x.kurt(), acf1=x.autocorr(1), acf5=x.autocorr(5), acf22=x.autocorr(22)))
+    log_rv = pd.DataFrame({s: np.log(d["rv"]) for s, d in bundles.items()})
+    common = log_rv.dropna()
+    corr = common.corr().rename_axis("instrument").reset_index()
+    sample = pd.DataFrame([dict(instruments=", ".join(log_rv.columns), common_days=len(common),
+                                first=common.index[0] if len(common) else pd.NaT, last=common.index[-1] if len(common) else pd.NaT)])
+    return {"descriptive_statistics": pd.DataFrame(rows), "correlation_log_rv": corr, "correlation_log_rv_sample": sample}
+
+
 def evaluate_all(cfg: StudyConfig, out_dir: Path, tables_dir: Path, figures_dir: Path,
-                 progress: Callable[[str], None] = print) -> list[tuple[str, int, float]]:
+                 progress: Callable[[str], None] = print, clean_dir: Path | None = None) -> list[tuple[str, int, float]]:
     """
     Evaluate every variant from its stored task results: tables (CSV and LaTeX), figures, the instruments that were
-    stopped, and for the primary run the MSE-loss tables of robustness check 7. Returns (variant, instruments, seconds).
+    stopped, and for the primary run the MSE-loss tables of robustness check 7. With clean_dir (the daily rows of stage 0)
+    also the descriptive statistics and the log-RV correlation matrix of the panel. Returns (variant, instruments, seconds).
     """
     summary = []
+    if clean_dir is not None:
+        bundles = {i.symbol: variant_daily(pd.read_parquet(bundle_file(clean_dir, i.symbol, "main")), "primary") for i in cfg.instruments}
+        write_tables(descriptive_tables(bundles), tables_dir, "data")
+        progress("wrote the descriptive statistics and the log-RV correlation matrix")
     for name in cfg.variants:
         results, stopped = load_variant_results(out_dir, name, variant_symbols(cfg, name))
         if stopped:                                          # PRESPEC 6: first HMM fit failed, instrument stopped

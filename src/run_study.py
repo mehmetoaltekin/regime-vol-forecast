@@ -217,7 +217,7 @@ def run_full(config_path: Path, workers: int | None = None, resume: bool = False
 
     # stage 2: evaluation of the stored results
     log("stage 2: evaluation")
-    summary = S.evaluate_all(cfg, out_dir, RESULTS / "tables", RESULTS / "figures", log)
+    summary = S.evaluate_all(cfg, out_dir, RESULTS / "tables", RESULTS / "figures", log, clean_dir=clean_dir)
     write_run_info(cfg, version, commit, hashes, started, time.time() - t0, summary, config_path,
                    extra={"workers": workers, "bundle_hashes": bundle_hashes, "resumed": resume})
     log("finished")

@@ -96,6 +96,11 @@ def test_every_variant_runs_through_all_three_stages_with_worker_processes(tmp_p
         assert (res / "figures" / f"{v}__prob_stress.pdf").exists() and (res / "figures" / f"{v}__cum_qlike_diff.pdf").exists()
         assert (res / "tables" / f"{v}__counters.tex").exists() and (res / "tables" / f"{v}__regime_summary.csv").exists()
     assert (res / "tables" / "mse_loss__mean_loss.csv").exists()
+    desc = pd.read_csv(res / "tables" / "data__descriptive_statistics.csv")
+    assert set(desc["instrument"]) == {"AAA", "BBB", "CCC", "DDD"} and set(desc["variable"]) == {"return (%)", "RV (%^2)", "log RV"}
+    corr = pd.read_csv(res / "tables" / "data__correlation_log_rv.csv").set_index("instrument")
+    assert list(corr.index) == list(corr.columns) == ["AAA", "BBB", "CCC", "DDD"] and np.allclose(np.diag(corr), 1.0)
+    assert (res / "tables" / "data__descriptive_statistics.tex").exists() and (res / "tables" / "data__correlation_log_rv_sample.csv").exists()
     es = pd.read_csv(res / "tables" / "primary__effect_sizes.csv")
     assert {"pooled", "AAA", "BBB", "CCC", "DDD"} == set(es["scope"]) and es["ci_low_pct"].notna().all()
     assert len(pd.read_csv(res / "tables" / "primary__dm_by_instrument.csv").query("family == 'H3' and h == 1")) == 8   # 2 x 4 tests
