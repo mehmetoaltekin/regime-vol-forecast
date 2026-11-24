@@ -140,6 +140,14 @@ def test_a_failed_refit_keeps_the_previous_parameters_and_the_filter_continues(m
     assert len(res.forecasts.xs("all", level="model").xs(1, level="h")) == len(data) - 100
 
 
+def test_a_burn_in_too_short_for_the_hmm_features_stops_with_the_number_of_days_missing():
+    """The first retained day has no previous close, so a burn-in of 0 leaves exactly one day without an HMM feature: the run says so."""
+    daily = make_daily(330, seed=6)
+    with pytest.raises(ValueError, match=r"1 days after the burn-in have no HMM feature \(first: 2015-01-01\)"):
+        run_walk_forward(daily, [LastValue()], WFConfig(window=100, refit_every=30, burn_in=0), FAST)
+    run_walk_forward(daily, [LastValue()], WFConfig(window=100, refit_every=30, burn_in=1), FAST)           # one day of burn-in is enough
+
+
 def test_a_failure_at_the_first_refit_stops_the_instrument(monkeypatch):
     daily = make_daily(330, seed=6)
     cfg = WFConfig(window=100, refit_every=30, burn_in=22)
