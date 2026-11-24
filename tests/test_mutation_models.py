@@ -330,6 +330,23 @@ def test_regime_weighted_har_ess_threshold_is_strict_and_uses_the_exact_ess():
         assert m.extra_counts[(1, "ess_fallback_regimes")] == int(fallback)
 
 
+def test_regime_weighted_har_ess_is_the_squared_sum_of_weights_over_the_sum_of_squared_weights():
+    """PRESPEC 5, M6 details: ESS_k = (sum pi)^2 / sum pi^2. 100 rows of weight 0.5 have ESS 100, not their weight sum 50."""
+    w = np.zeros(300)
+    w[100:200] = 0.5
+    d, filt, win = _ess_window(w)
+    y = d["rv"].to_numpy()
+    X, t = _har_regressors(y), _sum_target(y, 1)
+    own1 = _lstsq(X[100:200], t[100:200])                                      # a constant weight does not change the weighted fit
+    pooled = _lstsq(X, t)
+    assert np.abs(own1 - pooled).max() > 1e-3
+    for min_ess, fallback in ((99.0, False), (100.0, False), (101.0, True)):
+        m = M.RegimeWeightedHar(min_ess)
+        assert m.fit(win, 1)
+        assert np.allclose(m.est[1][1], pooled if fallback else own1, rtol=1e-8), min_ess
+        assert m.extra_counts[(1, "ess_fallback_regimes")] == int(fallback)
+
+
 def test_regime_weighted_har_regime_without_weight_falls_back_to_pooled():
     """A regime whose weights are all zero has ESS 0 and uses the pooled HAR, and the fallback is counted (PRESPEC 5, M6 details)."""
     d, filt, win = _ess_window(np.zeros(300))
