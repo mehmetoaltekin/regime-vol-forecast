@@ -30,6 +30,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import re
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
@@ -595,9 +596,14 @@ def evaluate_run(results: dict[str, WFResult], cfg: StudyConfig, families: dict 
 
 # ------------------------------------------------------------------------------------------------ output
 
+LATEX_SPECIAL = {"\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "_": r"\_", "#": r"\#", "$": r"\$",
+                 "^": r"\textasciicircum{}", "~": r"\textasciitilde{}", "{": r"\{", "}": r"\}"}
+
+
 def latex_escape(s: str) -> str:
-    return (str(s).replace("\\", r"\textbackslash{}").replace("&", r"\&").replace("%", r"\%").replace("_", r"\_")
-            .replace("#", r"\#").replace("$", r"\$"))
+    """Text for a LaTeX table cell: every character that LaTeX reads as a command is written out (one pass, so the braces of
+    the replacements are not escaped again)."""
+    return re.sub(r"[\\&%_#$^~{}]", lambda m: LATEX_SPECIAL[m.group()], str(s))
 
 
 def to_latex(df: pd.DataFrame, float_fmt: str = "{:.4g}") -> str:

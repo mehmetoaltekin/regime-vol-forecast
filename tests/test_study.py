@@ -98,6 +98,20 @@ def test_figures_tables_and_latex(primary, tmp_path):
     assert S.latex_escape("a_b & 100% #1") == r"a\_b \& 100\% \#1"
 
 
+def test_latex_escape_writes_out_every_special_character():
+    """The descriptive-statistics table has a variable called 'RV (%^2)': a bare ^ in text mode is a LaTeX error."""
+    import re
+    s = "a\\b & 50% _x_ #1 $5 ^2 ~ {c} RV (%^2)"
+    out = S.latex_escape(s)
+    assert out == r"a\textbackslash{}b \& 50\% \_x\_ \#1 \$5 \textasciicircum{}2 \textasciitilde{} \{c\} RV (\%\textasciicircum{}2)"
+    written_out = re.sub(r"\\(textbackslash|textasciicircum|textasciitilde)\{\}|\\[&%_#${}]", "", out)
+    assert not re.search(r"[\\&%_#$^~{}]", written_out)                                   # nothing special is left bare
+    assert S.latex_escape(5) == "5" and S.latex_escape("") == ""
+    table = S.to_latex(pd.DataFrame({"variable": ["RV (%^2)", "x~y"], "mean_loss": [1.5, 2.0]}))
+    assert r"RV (\%\textasciicircum{}2) & 1.5" in table and r"x\textasciitilde{}y & 2" in table and r"mean\_loss" in table
+
+
+
 def test_the_variants_run_and_name_their_models():
     cfg = small_cfg(window=100, horizons=(1,))
     d = {"AAA": synth(3, 300)}
