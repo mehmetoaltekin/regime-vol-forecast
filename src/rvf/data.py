@@ -49,8 +49,10 @@ def bounce_back_mask(df: pd.DataFrame, sd_mult: float, reversal: float = 0.75, l
     minute earlier. The robust SD of a bar on trading day D is 1.4826 times the median absolute deviation of all
     one-minute returns of the `lookback_days` trading days before D (days with bars; past data only; nothing is
     flagged on the first `lookback_days` days). A bar is flagged if |r| > sd_mult * SD and the next bar, exactly one
-    minute later, returns at least `reversal` of r in the opposite direction (overshoot counts). One pass on the
-    returns of the data as given; flagged bars are not removed before the next bar is judged.
+    minute later and on the same server day, returns at least `reversal` of r in the opposite direction (overshoot
+    counts). The last minute of a server day is therefore not judged: its next minute belongs to the next day, and the
+    data of a day must not depend on later days. One pass on the returns of the data as given; flagged bars are not
+    removed before the next bar is judged.
     """
     ts = df["ts"].to_numpy()
     c = df["close"].to_numpy(dtype=float)
@@ -69,7 +71,7 @@ def bounce_back_mask(df: pd.DataFrame, sd_mult: float, reversal: float = 0.75, l
             scale[i] = 1.4826 * np.median(np.abs(x - np.median(x)))
     sd = np.repeat(scale, np.diff(bounds))
     nxt = np.full(n, np.nan)
-    nxt[:-1] = r[1:]
+    nxt[:-1] = np.where(day[1:] == day[:-1], r[1:], np.nan)                   # the next bar must be on the same server day
     with np.errstate(invalid="ignore"):
         big = np.abs(r) > sd_mult * sd
         back = -nxt * np.sign(r) >= reversal * np.abs(r)
