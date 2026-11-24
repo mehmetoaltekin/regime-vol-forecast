@@ -1,0 +1,92 @@
+# regime-vol-forecast
+
+Study 1 of 3 in a series on hidden-Markov-model (HMM) regimes: do causal, real-time regime probabilities improve
+out-of-sample daily realised-variance forecasts of standard models (EWMA, GARCH(1,1), HAR-RV)?
+
+The design is pre-registered in [`PRESPEC.md`](PRESPEC.md) (a draft until it is approved, tagged `prespec-v1.0` and
+the full run has been made). This repository holds the data pipeline, the estimation and evaluation code, and the
+unit tests. It holds no data and, until the full run, no results.
+
+## Panel and data
+
+- Five instruments: XAUUSD, XAGUSD (precious metals), EURUSD, USDJPY, GBPUSD (FX). Sample 2008-11-10 to 2026-10-31.
+- Source: 1-minute bars exported from the MetaQuotes-Demo server of MetaTrader 5, bid-based, server time. The raw
+  files stay out of git (`data/`); `results/raw_data_sha256.tsv` holds their SHA-256 hashes.
+- US500, USTEC and DE40 were exported and audited but are not part of the study. Only the first training window of
+  US500 (2017-03-21 to 2021-02-04) is used, for development.
+- The audit is in [`results/data_audit.md`](results/data_audit.md), the effect of every cleaning rule in
+  [`results/sample_definition.md`](results/sample_definition.md).
+
+## Setup
+
+Python 3.12 and [uv](https://docs.astral.sh/uv/). The package versions are pinned in `pyproject.toml` and `uv.lock`:
+
+| package | version | package | version |
+|---|---|---|---|
+| hmm-regime | 0.2.0 | statsmodels | 0.15.0 |
+| hmmlearn | 0.3.3 | scipy | 1.18.1 |
+| arch | 9.0.0 | numpy | 2.5.5 |
+| pandas | 3.1.1 | pyarrow | 26.0.1 |
+| matplotlib | 3.11.2 | pytest | 9.2.0 |
+
+```bash
+uv sync
+```
+
+## From `data/raw/` to `results/`
+
+Every step below reads the output of the one before.
+
+```bash
+# 1. raw data (macOS, MetaTrader 5 installed and logged in to MetaQuotes-Demo, terminal closed; about 75 minutes)
+python3 src/mt5_export.py
+#    -> data/raw/<SYMBOL>_M1_<first>_<last>.csv, data/raw/export_meta.tsv, results/raw_data_sha256.tsv
+
+# 2. data audit (data quality only; about 40 seconds)
+uv run python src/audit_data.py
+#    -> results/data_audit.md, results/data_audit/
+
+# 3. sample definition: what each rule of PRESPEC 12.5-12.7 removes, per instrument
+uv run python src/sample_definition.py
+#    -> results/sample_definition.md, results/sample_definition/<SYMBOL>_days.csv
+
+# 4. unit tests (including a no-look-ahead test for every model and for the regime series)
+uv run pytest
+
+# 5. development run: US500, first training window only, window 500; writes to results/dev/ (git-ignored)
+uv run python src/run_study.py --dev
+```
+
+### The full run
+
+The full run is made once, on frozen code, and only when Saye says so:
+
+```bash
+uv run python src/run_study.py --full --config config/study_config.json
+```
+
+It refuses to start unless `PRESPEC.md` is version 1.0 or later and no longer says DRAFT, the repo carries the tag
+`prespec-v1.0` on a commit whose `PRESPEC.md` equals the current one, the configuration names the same version, tracked
+files are committed, the raw files match their stored hashes, and neither `results/RUN_INFO.md` nor
+`results/RUN_STARTED.lock` exists.
+
+It writes the tables of the primary run and of the ten robustness checks to `results/tables/` (CSV and LaTeX), the
+figures to `results/figures/` (PDF), the forecasts to `results/forecasts/` (parquet, git-ignored) and `results/RUN_INFO.md`
+(commit hash, package versions, data hashes, run date, configuration).
+
+## Layout
+
+| path | content |
+|---|---|
+| `config/study_config.json` | every number of the pre-specification that the code needs |
+| `src/rvf/data.py` | M1 loader, bar-level cleaning, bounce-back filter |
+| `src/rvf/realized.py` | realised variance and quarticity, range estimators, daily returns, day-level rules |
+| `src/rvf/regime.py` | causal HMM regime series (`hmm-regime`): `prob_stress`, h-step probabilities |
+| `src/rvf/walkforward.py` | rolling window, shared refit calendar, burn-in, vintage probabilities, HMM failure rule |
+| `src/rvf/models.py` | M0-M7, M2c and the robustness variants (log-HAR, HARQ) |
+| `src/rvf/evaluate.py` | QLIKE, MSE, Diebold-Mariano, pooled test, Holm, MCS, Giacomini-White, effect sizes |
+| `src/rvf/study.py` | variants, evaluation tables, LaTeX and figure writers |
+| `src/run_study.py`, `src/sample_definition.py`, `src/audit_data.py`, `src/mt5_export.py` | command-line scripts |
+| `tests/` | unit tests |
+
+The code is written to be reused by the later studies in the series (`regime-factor-premia`, `regime-option-hedging`).

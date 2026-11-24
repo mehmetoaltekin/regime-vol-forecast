@@ -413,18 +413,18 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "arch", specifier = ">=7" },
+    { name = "arch", specifier = "==9.0.0" },
     { name = "hmm-regime", specifier = "==0.2.0" },
-    { name = "matplotlib", specifier = ">=3.11.2" },
-    { name = "numpy", specifier = ">=2.0" },
-    { name = "pandas", specifier = ">=2.2" },
-    { name = "pyarrow", specifier = ">=17" },
-    { name = "scipy", specifier = ">=1.13" },
-    { name = "statsmodels", specifier = ">=0.14" },
+    { name = "matplotlib", specifier = "==3.11.2" },
+    { name = "numpy", specifier = "==2.5.5" },
+    { name = "pandas", specifier = "==3.1.1" },
+    { name = "pyarrow", specifier = "==26.0.1" },
+    { name = "scipy", specifier = "==1.18.1" },
+    { name = "statsmodels", specifier = "==0.15.0" },
 ]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8" }]
+dev = [{ name = "pytest", specifier = "==9.2.0" }]
 
 [[package]]
 name = "scikit-learn"
