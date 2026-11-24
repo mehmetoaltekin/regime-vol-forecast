@@ -75,3 +75,14 @@ def test_a_day_that_is_both_short_and_stale_is_counted_once():
     assert d["flagged_short"] == 1 and d["flagged_stale"] == 1 and d["short_and_stale"] == 1
     assert d["removed_short"] == 1 and d["removed_stale_not_short"] == 0
     assert d["days_with_bars"] == 40 and d["retained"] == 40 - 1 - 1
+
+
+def test_the_report_shows_a_config_path_given_relative_to_the_working_directory(tmp_path, monkeypatch):
+    """`sample_definition.py --config config/study_config.json` crashed after all the computation, when the path was written."""
+    import sample_definition as SD
+    monkeypatch.chdir(SD.ROOT)
+    assert SD.shown(Path("config/study_config.json")) == "config/study_config.json"
+    assert SD.shown(SD.ROOT / "config" / "study_config.json") == "config/study_config.json"
+    assert SD.shown(Path("config/../config/study_config.json")) == "config/study_config.json"
+    outside = tmp_path / "other.json"
+    assert SD.shown(outside) == str(outside.resolve())                                 # a file outside the repository is shown in full
