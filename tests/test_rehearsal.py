@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -190,6 +191,8 @@ def test_an_interrupted_run_is_resumed_and_gives_the_same_results(tmp_path, monk
     assert ran == [("primary", "DDD"), ("harq", "BBB")]                                   # nothing else
     assert (res2 / "RUN_INFO.md").exists() and not (res2 / "RUN_STARTED.lock").exists()
     assert "the run was resumed" in (res2 / "RUN_INFO.md").read_text() and key in (res2 / "RUN_INFO.md").read_text()
+    started = datetime.fromisoformat(lock["started"])                                     # a resume keeps the start of the first session
+    assert f"Run started (UTC): {started:%Y-%m-%d %H:%M:%S}" in (res2 / "RUN_INFO.md").read_text()
     assert {p.name: p.read_bytes() for p in (repo2 / "data" / "clean").glob("*.parquet")} == clean_ref
     for v in variants:
         for s in S.variant_symbols(cfg, v):
