@@ -19,6 +19,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from rvf.data import load_m1
+
 ROOT = Path(__file__).resolve().parents[1]
 RAW = ROOT / "data/raw"
 OUT_MD = ROOT / "results/data_audit.md"
@@ -37,17 +39,9 @@ SHORT_DAY_SHARE = 0.5                                # short-day rule: fewer tha
 STALE_SHARE = 0.5                                    # a "stale day": more than half of its one-minute returns are zero
 JUMP_NS = (10, 20, 30)                               # thresholds in robust standard deviations
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-COLS = ["date", "time", "open", "high", "low", "close", "tickvol", "vol", "spread"]
 
 
 # ----------------------------------------------------------------------------------------------- loading
-
-def load_m1(path: Path) -> pd.DataFrame:
-    """MT5 export (tab-separated, header <DATE>..<SPREAD>) -> frame with a 'ts' column, in file order."""
-    df = pd.read_csv(path, sep="\t", header=0, names=COLS, dtype={"date": "str", "time": "str"})
-    df["ts"] = pd.to_datetime(df.pop("date") + " " + df.pop("time"), format="%Y.%m.%d %H:%M:%S")
-    return df[["ts", "open", "high", "low", "close", "tickvol", "vol", "spread"]]
-
 
 def read_meta(path: Path) -> dict:
     meta: dict = {}
