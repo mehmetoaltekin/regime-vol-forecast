@@ -50,8 +50,11 @@ uv run python src/audit_data.py
 uv run python src/sample_definition.py
 #    -> results/sample_definition.md, results/sample_definition/<SYMBOL>_days.csv
 
-# 4. unit tests (including a no-look-ahead test for every model and for the regime series)
+# 4. unit tests (including a no-look-ahead test for every model and for the regime series; about two minutes)
 uv run pytest
+#    dress rehearsal of the whole full run (all variants, worker processes, an interruption and a resume) on
+#    synthetic data; about four minutes
+uv run pytest -m slow
 
 # 5. development run: US500, first training window only, window 500; writes to results/dev/ (git-ignored)
 uv run python src/run_study.py --dev
@@ -62,8 +65,28 @@ uv run python src/run_study.py --dev
 The full run is made once, on frozen code, and only when Saye says so:
 
 ```bash
-uv run python src/run_study.py --full --config config/study_config.json
+caffeinate -i uv run python src/run_study.py --full --config config/study_config.json --workers 8
 ```
+
+`caffeinate -i` keeps the Mac awake. The work is split into one walk-forward task per (variant, instrument), run in
+`--workers` processes (default: CPU count minus two) with one BLAS thread each, so the numbers do not depend on the number
+of workers. The Markov-switching HAR (M7) dominates the cost: about 2.5 to 7 seconds per refit and horizon on a
+1000-day window (measured on synthetic data), roughly 40 minutes per instrument and variant. Added up over the five
+instruments and the variants that contain M7 this is on the order of 55 hours of single-core time, so about 7 to 8 hours
+with 8 workers. This is an estimate; `results/run_progress.log` shows the real progress.
+
+If the run is interrupted (machine asleep, process killed), continue it:
+
+```bash
+caffeinate -i uv run python src/run_study.py --full --config config/study_config.json --workers 8 --resume
+```
+
+`--resume` needs `results/RUN_STARTED.lock`, the same commit, the same configuration and the same `PRESPEC.md`, and skips
+the tasks that are finished. If the code has to change, the finished tasks are void: start again from an empty
+`results/forecasts/` and no lock.
+
+The run has three stages. Stage 0 prepares the daily rows of every instrument (`data/clean/`, git-ignored); a data problem
+stops the run here, before the lock is written. Stage 1 runs the tasks. Stage 2 evaluates the stored results.
 
 It refuses to start unless `PRESPEC.md` is version 1.0 or later and no longer says DRAFT, the repo carries the tag
 `prespec-v1.0` on a commit whose `PRESPEC.md` equals the current one, the configuration names the same version, tracked
@@ -72,7 +95,7 @@ files are committed, the raw files match their stored hashes, and neither `resul
 
 It writes the tables of the primary run and of the ten robustness checks to `results/tables/` (CSV and LaTeX), the
 figures to `results/figures/` (PDF), the forecasts to `results/forecasts/` (parquet, git-ignored) and `results/RUN_INFO.md`
-(commit hash, package versions, data hashes, run date, configuration).
+(commit hash, package versions, hashes of the raw data and of the prepared daily rows, run date, configuration).
 
 ## Layout
 
@@ -85,7 +108,7 @@ figures to `results/figures/` (PDF), the forecasts to `results/forecasts/` (parq
 | `src/rvf/walkforward.py` | rolling window, shared refit calendar, burn-in, vintage probabilities, HMM failure rule |
 | `src/rvf/models.py` | M0-M7, M2c and the robustness variants (log-HAR, HARQ) |
 | `src/rvf/evaluate.py` | QLIKE, MSE, Diebold-Mariano, pooled test, Holm, MCS, Giacomini-White, effect sizes |
-| `src/rvf/study.py` | variants, evaluation tables, LaTeX and figure writers |
+| `src/rvf/study.py` | variants, daily bundles, tasks and workers, evaluation tables, LaTeX and figure writers |
 | `src/run_study.py`, `src/sample_definition.py`, `src/audit_data.py`, `src/mt5_export.py` | command-line scripts |
 | `tests/` | unit tests |
 
