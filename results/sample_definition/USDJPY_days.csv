@@ -2720,7 +2720,7 @@ server_day,bars,n_active,zero_share,short,stale,anchor,kept
 2019-05-01,1439,264,0.177677,False,False,False,True
 2019-05-02,1440,264,0.125095,False,False,False,True
 2019-05-03,1438,264,0.160728,False,False,False,True
-2019-05-06,1437,264,0.102350,False,False,False,True
+2019-05-06,1438,264,0.102350,False,False,False,True
 2019-05-07,1439,264,0.058378,False,False,False,True
 2019-05-08,1440,264,0.068234,False,False,False,True
 2019-05-09,1440,264,0.084913,False,False,False,True
