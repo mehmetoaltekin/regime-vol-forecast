@@ -15,6 +15,17 @@ pure HMM forecast iterate their own recursion. All estimates are kept per horizo
   m6   regime-weighted   one HAR per regime by weighted least squares; weights and forecast mix are the
        HAR               one-step-ahead regime probabilities; a regime with too small an effective sample uses m3
   m7   MS-HAR            two-regime Markov-switching regression (statsmodels), filtered probabilities only
+
+Robustness variants (names with a suffix):
+  m3_log, m5_log, m6_log, m7_log   the same models on log variance: log of the h-day sum on log regressors (the
+                                   weekly and monthly terms average the daily logs); forecasts are converted back
+                                   with exp(fit + s2 / 2), s2 the residual variance of the training window (per
+                                   regime for m6 and m7)
+  m3_q, m5_q                       HARQ and HARQ-X (Bollerslev, Patton and Quaedvlieg 2016): the daily term is
+                                   multiplied by (b_d + b_q * sqrt(RQ_t))
+
+With vintage training (WFConfig.vintage_training) m4, m5 and m6 are estimated on the regime probabilities as they
+were computed on each training day; forecasts always use the probability of the origin.
 """
 from __future__ import annotations
 
@@ -28,6 +39,7 @@ from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 from rvf.walkforward import Window, cumulative_target
 
 HAR = ["har_d", "har_w", "har_m"]
+LOG_HAR = ["lhar_d", "lhar_w", "lhar_m"]
 
 
 def ols(X: np.ndarray, y: np.ndarray, w: np.ndarray | None = None) -> np.ndarray:
@@ -40,12 +52,35 @@ def ols(X: np.ndarray, y: np.ndarray, w: np.ndarray | None = None) -> np.ndarray
     return np.linalg.lstsq(X, y, rcond=None)[0]
 
 
-def har_x(win: Window, extra: np.ndarray | None = None) -> np.ndarray:
-    """Regressor matrix [1, daily, weekly, monthly (, extra)] for every row of the window."""
-    cols = [np.ones(len(win.data)), *(win.data[c].to_numpy(dtype=float) for c in HAR)]
+def har_x(win: Window, extra: np.ndarray | None = None, log: bool = False, q: bool = False) -> np.ndarray:
+    """
+    Regressor matrix [1, daily, weekly, monthly (, sqrt(RQ) * daily) (, extra)] for every row of the window.
+    log=True uses the log regressors; q=True adds the HARQ term (levels only).
+    """
+    cols = [np.ones(len(win.data)), *(win.data[c].to_numpy(dtype=float) for c in (LOG_HAR if log else HAR))]
+    if q:
+        if log:
+            raise ValueError("HARQ is a levels model")
+        cols.append(np.sqrt(win.data["rq"].to_numpy(dtype=float)) * win.data["har_d"].to_numpy(dtype=float))
     if extra is not None:
         cols.append(extra)
     return np.column_stack(cols)
+
+
+def log_target(win: Window, h: int) -> np.ndarray:
+    """Log of the h-day variance sum; NaN where the sum is not positive or runs past the window."""
+    t = cumulative_target(win.y, h)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.log(np.where(t > 0, t, np.nan))
+
+
+def resid_var(X: np.ndarray, y: np.ndarray, beta: np.ndarray, w: np.ndarray | None = None) -> float:
+    """Residual variance of a (weighted) regression on the rows where X and y are finite."""
+    ok = np.isfinite(X).all(axis=1) & np.isfinite(y)
+    e = y[ok] - X[ok] @ beta
+    if w is None:
+        return float(e @ e / max(ok.sum() - X.shape[1], 1))
+    return float((w[ok] * e ** 2).sum() / w[ok].sum())
 
 
 class _Base:
@@ -122,16 +157,16 @@ class CalibratedGarch(_Base):
         self.name = "m4" if with_regime else "m2c"
         self.garch = Garch()
 
-    def _x(self, win: Window, h: int) -> np.ndarray:
+    def _x(self, win: Window, h: int, fit: bool = False) -> np.ndarray:
         cols = [np.ones(len(win.data)), self.garch.path(win, h)]
         if self.with_regime:
-            cols.append(win.p)
+            cols.append(win.p_fit if fit else win.p)
         return np.column_stack(cols)
 
     def fit(self, win: Window, h: int) -> bool:
         if not self.garch.fit(win, h):
             return False                           # the previous refit's GARCH parameters and coefficients stay
-        self.est[h] = ols(self._x(win, h), cumulative_target(win.y, h))
+        self.est[h] = ols(self._x(win, h, fit=True), cumulative_target(win.y, h))
         return True
 
     def predict(self, win: Window, h: int) -> float | None:
@@ -141,68 +176,100 @@ class CalibratedGarch(_Base):
 
 
 class Har(_Base):
-    """HAR-RV (m3), optionally with prob_stress (m5)."""
+    """
+    HAR-RV (m3), with prob_stress (m5), in logs (suffix _log) or as HARQ (suffix _q). est[h] is the coefficient
+    vector for levels models and (coefficients, residual variance) for log models.
+    """
 
-    def __init__(self, with_regime: bool = False):
+    def __init__(self, with_regime: bool = False, log: bool = False, q: bool = False):
         super().__init__()
-        self.with_regime = with_regime
-        self.name = "m5" if with_regime else "m3"
+        if log and q:
+            raise ValueError("HARQ is a levels model")
+        self.with_regime, self.log, self.q = with_regime, log, q
+        self.name = ("m5" if with_regime else "m3") + ("_log" if log else "") + ("_q" if q else "")
 
-    def _x(self, win: Window) -> np.ndarray:
-        return har_x(win, win.p if self.with_regime else None)
+    def _x(self, win: Window, fit: bool = False) -> np.ndarray:
+        extra = (win.p_fit if fit else win.p) if self.with_regime else None
+        return har_x(win, extra, log=self.log, q=self.q)
 
     def fit(self, win: Window, h: int) -> bool:
-        self.est[h] = ols(self._x(win), cumulative_target(win.y, h))
+        X = self._x(win, fit=True)
+        if self.log:
+            y = log_target(win, h)
+            beta = ols(X, y)
+            self.est[h] = (beta, resid_var(X, y, beta))
+        else:
+            self.est[h] = ols(X, cumulative_target(win.y, h))
         return True
 
     def predict(self, win: Window, h: int) -> float | None:
-        return float(self._x(win)[-1] @ self.est[h])
+        x = self._x(win)[-1]
+        if self.log:
+            beta, s2 = self.est[h]
+            return float(np.exp(x @ beta + 0.5 * s2))
+        return float(x @ self.est[h])
 
 
 class RegimeWeightedHar(_Base):
-    """One HAR per regime (m6). est[h] has one coefficient row per regime."""
-    name = "m6"
+    """
+    One HAR per regime (m6), in levels or logs (m6_log). est[h] has one coefficient row per regime for levels, and
+    (coefficient rows, residual variance per regime) for logs.
+    """
 
-    def __init__(self, min_ess: float = 100.0):
+    def __init__(self, min_ess: float = 100.0, log: bool = False):
         super().__init__()
-        self.min_ess = min_ess
+        self.min_ess, self.log = min_ess, log
+        self.name = "m6_log" if log else "m6"
 
     def fit(self, win: Window, h: int) -> bool:
-        X, y, W = har_x(win), cumulative_target(win.y, h), win.pi(1)
+        X = har_x(win, log=self.log)
+        y = log_target(win, h) if self.log else cumulative_target(win.y, h)
+        W = win.pi_fit()
         ok = np.isfinite(X).all(axis=1) & np.isfinite(y)
         pooled = ols(X, y)
-        betas, fell_back = [], 0
+        pooled_s2 = resid_var(X, y, pooled) if self.log else None
+        betas, s2s, fell_back = [], [], 0
         for k in range(W.shape[1]):
             w = W[ok, k]
             ess = w.sum() ** 2 / (w ** 2).sum() if w.sum() > 0 else 0.0
             if ess < self.min_ess:
                 betas.append(pooled)
+                s2s.append(pooled_s2)
                 fell_back += 1
             else:
-                betas.append(ols(X, y, W[:, k]))
-        self.est[h] = np.array(betas)
+                b = ols(X, y, W[:, k])
+                betas.append(b)
+                s2s.append(resid_var(X, y, b, W[:, k]) if self.log else None)
+        self.est[h] = (np.array(betas), np.array(s2s)) if self.log else np.array(betas)
         self.extra_counts[(h, "ess_fallback_refits")] = self.extra_counts.get((h, "ess_fallback_refits"), 0) + (fell_back > 0)
         self.extra_counts[(h, "ess_fallback_regimes")] = self.extra_counts.get((h, "ess_fallback_regimes"), 0) + fell_back
         return True
 
     def predict(self, win: Window, h: int) -> float | None:
-        return float(win.pi(1)[-1] @ (self.est[h] @ har_x(win)[-1]))
+        x, pi = har_x(win, log=self.log)[-1], win.pi(1)[-1]
+        if self.log:
+            betas, s2s = self.est[h]
+            return float(pi @ np.exp(betas @ x + 0.5 * s2s))
+        return float(pi @ (self.est[h] @ x))
 
 
 class MsHar(_Base):
     """
-    Markov-switching HAR (m7): switching intercept, slopes and variance, two regimes. Each refit runs `n_starts`
-    random starting values plus the previous refit's estimate and keeps the converged fit with the highest
-    likelihood. The forecast mixes the regime regressions with predicted probabilities built from filtered
-    probabilities only. Target and regressors are divided by the training window's mean variance for the optimiser.
-    est[h] = (parameters, scale, stress regime).
+    Markov-switching HAR (m7), in levels or logs (m7_log): switching intercept, slopes and variance, two regimes.
+    Each refit runs `n_starts` random starting values plus the previous refit's estimate and keeps the converged
+    fit with the highest likelihood. The forecast mixes the regime regressions with predicted probabilities built
+    from filtered probabilities only. In levels, target and regressors are divided by the training window's mean
+    variance for the optimiser; in logs they are used as they are, and each regime's forecast is
+    exp(fit + sigma2_k / 2). est[h] = (parameters, scale, stress regime).
     """
     name, fallback = "m7", "m3"
 
-    def __init__(self, n_starts: int = 10, seed: int = 0, maxiter: int = 200):
+    def __init__(self, n_starts: int = 10, seed: int = 0, maxiter: int = 200, log: bool = False):
         super().__init__()
-        self.n_starts, self.seed, self.maxiter = n_starts, seed, maxiter
+        self.n_starts, self.seed, self.maxiter, self.log = n_starts, seed, maxiter, log
         self.n_fits = 0
+        if log:
+            self.name, self.fallback = "m7_log", "m3_log"
 
     @staticmethod
     def _model(y: np.ndarray, X: np.ndarray) -> MarkovRegression:
@@ -210,12 +277,13 @@ class MsHar(_Base):
                                 switching_variance=True)
 
     def _pairs(self, win: Window, h: int, scale: float):
-        X, y = har_x(win)[:, 1:] / scale, cumulative_target(win.y, h) / scale
+        X = har_x(win, log=self.log)[:, 1:] / scale
+        y = (log_target(win, h) if self.log else cumulative_target(win.y, h)) / scale
         ok = np.isfinite(X).all(axis=1) & np.isfinite(y)
         return y[ok], X[ok]
 
     def fit(self, win: Window, h: int) -> bool:
-        scale = float(np.nanmean(win.y))
+        scale = 1.0 if self.log else float(np.nanmean(win.y))
         y, X = self._pairs(win, h, scale)
         mod = self._model(y, X)
         rng = np.random.default_rng([self.seed, h, self.n_fits])
@@ -267,14 +335,15 @@ class MsHar(_Base):
         except Exception:
             return None
         prob = np.linalg.matrix_power(P, h) @ filt                      # regime of the pair whose regressors are day t
-        x = har_x(win)[-1, 1:] / scale
+        x = har_x(win, log=self.log)[-1, 1:] / scale
         names = mod.param_names
         f = 0.0
         for k in (0, 1):
             const = params[names.index(f"const[{k}]")]
             beta = np.array([params[names.index(f"x{j}[{k}]")] for j in (1, 2, 3)])
-            f += prob[k] * (const + beta @ x)
-        return float(f * scale)
+            mean = const + beta @ x
+            f += prob[k] * (np.exp(mean + 0.5 * params[names.index(f"sigma2[{k}]")]) if self.log else mean)
+        return float(f if self.log else f * scale)
 
 
 class PureHmm(_Base):
@@ -298,3 +367,13 @@ def all_models(min_ess: float = 100.0, ms_starts: int = 10) -> list:
     """M0-M7 and M2c in the pre-specified set-up."""
     return [PureHmm(), Ewma(), Garch(), CalibratedGarch(), Har(), CalibratedGarch(with_regime=True), Har(with_regime=True),
             RegimeWeightedHar(min_ess), MsHar(ms_starts)]
+
+
+def log_models(min_ess: float = 100.0, ms_starts: int = 10) -> list:
+    """Robustness check 4: log-HAR in place of levels HAR for M3, M5, M6 and M7."""
+    return [Har(log=True), Har(with_regime=True, log=True), RegimeWeightedHar(min_ess, log=True), MsHar(ms_starts, log=True)]
+
+
+def harq_models() -> list:
+    """Robustness check 10: HARQ against HARQ plus prob_stress."""
+    return [Har(q=True), Har(with_regime=True, q=True)]

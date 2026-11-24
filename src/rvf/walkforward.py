@@ -27,6 +27,7 @@ class WFConfig:
     horizons: tuple[int, ...] = (1,)
     target: str = "rv"                       # column holding the daily variance measure
     insanity_filter: bool = True
+    vintage_training: bool = False           # robustness check 9: train M4-M6 on the probabilities as computed on each day
 
 
 @dataclass
@@ -39,12 +40,15 @@ class Window:
     stress: np.ndarray | None = None          # boolean mask of the stress states
     state_var: np.ndarray | None = None       # return variance of each state, percent squared
     target: str = "rv"
+    vp: np.ndarray | None = None              # real-time vintage prob_stress per row (only with vintage_training)
+    vpi: np.ndarray | None = None             # real-time vintage one-step-ahead regime probabilities per row
 
     @property
     def train(self) -> "Window":
         n = self.n_train
         return Window(self.data.iloc[:n], n, None if self.filt is None else self.filt[:n], self.A, self.stress,
-                      self.state_var, self.target)
+                      self.state_var, self.target, None if self.vp is None else self.vp[:n],
+                      None if self.vpi is None else self.vpi[:n])
 
     @property
     def y(self) -> np.ndarray:
@@ -58,6 +62,15 @@ class Window:
     def pi(self, h: int = 1) -> np.ndarray:
         """h-step-ahead regime probabilities per row, shape (len(data), K)."""
         return ahead(self.filt, self.A, h)
+
+    @property
+    def p_fit(self) -> np.ndarray:
+        """prob_stress used as a regressor when estimating: the real-time vintage if the run asks for it."""
+        return self.vp if self.vp is not None else self.p
+
+    def pi_fit(self) -> np.ndarray:
+        """One-step-ahead regime probabilities used as weights when estimating (vintage if the run asks for it)."""
+        return self.vpi if self.vpi is not None else self.pi(1)
 
 
 class Model(Protocol):
@@ -81,8 +94,13 @@ def cumulative_target(y: np.ndarray, h: int) -> np.ndarray:
 
 
 def har_columns(y: pd.Series) -> pd.DataFrame:
-    """HAR regressors of day s from values up to s: the daily value and its 5- and 22-day averages."""
-    return pd.DataFrame({"har_d": y, "har_w": y.rolling(5).mean(), "har_m": y.rolling(22).mean()})
+    """
+    HAR regressors of day s from values up to s: the daily value and its 5- and 22-day averages (har_*), and the
+    same for log values, averaging the logs (lhar_*). Non-positive values give NaN logs.
+    """
+    ly = np.log(y.where(y > 0))
+    return pd.DataFrame({"har_d": y, "har_w": y.rolling(5).mean(), "har_m": y.rolling(22).mean(),
+                         "lhar_d": ly, "lhar_w": ly.rolling(5).mean(), "lhar_m": ly.rolling(22).mean()})
 
 
 def refit_origins(n: int, cfg: WFConfig) -> np.ndarray:
@@ -115,7 +133,21 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
     if n <= cfg.window:
         raise ValueError(f"{n} days are not enough for a window of {cfg.window}")
     y = data[cfg.target].to_numpy(dtype=float)
-    refits = set(refit_origins(n, cfg).tolist())
+    origins = refit_origins(n, cfg)
+    refits = set(origins.tolist())
+    if cfg.vintage_training:
+        if regime_cfg is None or isinstance(regime_cfg.n_components, tuple):
+            raise ValueError("vintage training needs an HMM with a fixed number of regimes")
+        # every row of a training window needs a probability computed on its own day: the first window only supplies them
+        usable = origins[origins >= 2 * cfg.window - 2]
+        if len(usable) == 0:
+            raise ValueError("not enough days for vintage training")
+        forecast_start = int(usable[0])
+        vp_all = np.full(n, np.nan)
+        vpi_all = np.full((n, regime_cfg.n_components), np.nan)
+    else:
+        forecast_start = cfg.window - 1
+        vp_all = vpi_all = None
     names = [m.name for m in models]
     used = [m.name for m in models if getattr(m, "est", None) or getattr(m, "extra_counts", None)]
     if used:
@@ -140,6 +172,12 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
             regime_rows.append((data.index[t], float(win.p[-1]), cal.k, refit, bool(cal.model.converged_),
                                 len(cal.model.warnings_)))
             vintage[data.index[t]] = filt[-1].copy()            # filtered vector as computed on day t
+            if vp_all is not None:
+                vp_all[t] = win.p[-1]
+                vpi_all[t] = filt[-1] @ cal.A
+                win.vp, win.vpi = vp_all[anchor: t + 1].copy(), vpi_all[anchor: t + 1].copy()
+        if t < forecast_start:
+            continue
 
         for h in cfg.horizons:
             if refit:
