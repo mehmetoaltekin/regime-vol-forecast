@@ -487,17 +487,29 @@ def _models(losses: pd.DataFrame) -> list[str]:
 
 
 def hmm_summary(results: dict[str, WFResult]) -> pd.DataFrame:
-    """Per instrument: origins, refits, HMM failures (PRESPEC 6), the failure share and the flag for more than 10%."""
+    """
+    Per instrument: origins, refits, HMM failures (PRESPEC 6), the failure share and the flag for more than 10%, the mean K,
+    and the quality of the fits. `hmm_not_converged` and `hmm_warnings` count refits (the refits that produced a new
+    calibration; a failed refit keeps the previous one and is counted under hmm_failures), not origin days.
+    `share_refits_return_split` is the share of those refits in which the stress states differ from the others more in the
+    return than in the range feature, in standard deviations of the feature (see RegimeCalibration.diagnostics): such a
+    fit splits on the sign of the return, not on volatility. It is NaN unless the features are (log_return, a range feature)
+    and the regime table carries the diagnostics.
+    """
     rows = []
     for sym, r in results.items():
         g = r.regime
         refits = int(g["refit"].sum())
         fails = int(g["hmm_failed"].sum())
         share = fails / refits if refits else np.nan
+        fitted = g[g["refit"] & ~g["hmm_failed"]]
+        sep = [c for c in g.columns if c.startswith("sep_")]
+        both = fitted[sep[:2]].dropna() if len(sep) >= 2 and sep[0] == "sep_log_return" else fitted.iloc[:0]
         rows.append(dict(instrument=sym, origins=len(g), refits=refits, hmm_failures=fails, hmm_failure_share=share,
                          flag_failures_over_10pct=bool(share > HMM_FAILURE_FLAG_SHARE), share_stress=float((g["prob_stress"] > 0.5).mean()),
-                         mean_k=float(g["k"].mean()), hmm_not_converged=int((~g["hmm_converged"]).sum()),
-                         hmm_warnings=int(g["hmm_warnings"].sum())))
+                         mean_k=float(g["k"].mean()), hmm_not_converged=int((~fitted["hmm_converged"]).sum()),
+                         hmm_warnings=int(fitted["hmm_warnings"].sum()),
+                         share_refits_return_split=float((both[sep[0]].abs() > both[sep[1]].abs()).mean()) if len(both) else np.nan))
     return pd.DataFrame(rows)
 
 

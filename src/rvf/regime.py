@@ -42,9 +42,14 @@ def hmm_features(daily: pd.DataFrame, cfg: RegimeConfig = RegimeConfig()) -> pd.
     Candidate HMM features per day, as the library defines them: log_return (close to close, decimal),
     log_range_var (per-bar log Parkinson variance), volatility (rolling annualised Parkinson), and log_rv
     (log realised variance, for the information-matched check). Rows with a missing selected feature are dropped.
+
+    log_return is the daily return r_cc / 100 when the frame has one: it equals log(close / previous close) on every day
+    except the first retained day after an anchor day (PRESPEC 12.6), whose return is measured from the anchor's close and
+    not across the whole gap, as for RV, EWMA and GARCH. The first row has no previous close and is dropped either way.
     """
     f = pd.DataFrame(index=daily.index)
-    f["log_return"] = np.log(daily["close"] / daily["close"].shift(1))
+    previous = daily["close"].shift(1)
+    f["log_return"] = (daily["r_cc"] / 100).where(previous.notna()) if "r_cc" in daily else np.log(daily["close"] / previous)
     f["log_range_var"] = compute_log_range_variance(daily["high"], daily["low"])
     f["volatility"] = compute_parkinson_volatility(daily["high"], daily["low"], window=cfg.vol_window, periods_per_year=252)
     if "rv" in daily:
@@ -86,6 +91,29 @@ class RegimeCalibration:
         if self.cfg.columns[0] != "log_return":
             return None
         return self.model.covars_[:, 0, 0] * 1e4
+
+    def diagnostics(self, X: np.ndarray, filt: np.ndarray) -> dict[str, float | int]:
+        """
+        What the fit looks like, so that the label of the stress state can be audited after the run: the number of stress
+        states, the share of the training window that the filter puts in them, the log-likelihood, and for every feature
+        `sep_<feature>`: the mean of the stress states minus the mean of the other states (both weighted by the window
+        occupancy of the states), in standard deviations of that feature over the window. A stress state that differs
+        from the others mainly in the return and not in the range is a split on the sign of the return, not a volatility regime.
+        """
+        stress, occupancy = self.stress, filt.mean(axis=0)
+        out = {"n_stress": int(stress.sum()), "stress_occupancy": float(occupancy[stress].sum()),
+               "hmm_loglik": float(self.model.log_likelihood_)}
+        sd = X.std(axis=0, ddof=1)
+        means = np.asarray(self.model.means_, dtype=float)
+        for j, name in enumerate(self.cfg.columns):
+            weights = (occupancy[stress].sum(), occupancy[~stress].sum())
+            if not all(w > 0 for w in weights) or not sd[j] > 0:
+                out[f"sep_{name}"] = np.nan
+                continue
+            hot = occupancy[stress] @ means[stress, j] / weights[0]
+            cold = occupancy[~stress] @ means[~stress, j] / weights[1]
+            out[f"sep_{name}"] = float((hot - cold) / sd[j])
+        return out
 
     def filter(self, X: np.ndarray, prior: np.ndarray | None = None) -> np.ndarray:
         """Filtered probabilities P(s_t | data up to t), shape (n, K). `prior` is the filtered vector of the bar before X[0]."""

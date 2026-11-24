@@ -173,7 +173,7 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
     by_name = dict(zip(names, models))
     count = {(m, h): dict(refits=0, failures=0, fallbacks=0, insane=0) for m in names for h in cfg.horizons}
     rows, regime_rows, vintage = [], [], {}
-    cal, filt, anchor, bounds = None, None, 0, {}
+    cal, filt, anchor, bounds, diag = None, None, 0, {}, {}
 
     for t in range(cfg.window - 1, n - 1):
         refit = t in refits
@@ -186,6 +186,7 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
                     if not np.isfinite(new.model.log_likelihood_):
                         raise ValueError("non-finite log-likelihood")
                     cal, filt = new, new.filter(X[anchor: t + 1])
+                    diag = cal.diagnostics(X[anchor: t + 1], filt)
                 except Exception as e:
                     if cal is None:
                         raise HmmFirstFitError(f"first HMM fit failed at {data.index[t].date()}: {e}") from e
@@ -199,7 +200,7 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
             (cal.A, cal.stress, cal.state_var) if cal is not None else (None, None, None)), cfg.target)
         if regime_cfg is not None:
             regime_rows.append((data.index[t], float(win.p[-1]), cal.k, refit, bool(cal.model.converged_),
-                                len(cal.model.warnings_), hmm_failed))
+                                len(cal.model.warnings_), hmm_failed, *diag.values()))
             vintage[data.index[t]] = filt[-1].copy()            # filtered vector as computed on day t
             if vp_all is not None:
                 vp_all[t] = win.p[-1]
@@ -235,7 +236,7 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
 
     fc = pd.DataFrame(rows, columns=["target_day", "model", "h", "origin", "forecast", "raw", "target", "source"])
     regime = pd.DataFrame(regime_rows, columns=["origin", "prob_stress", "k", "refit", "hmm_converged", "hmm_warnings",
-                                                "hmm_failed"]).set_index("origin")
+                                                "hmm_failed", *diag]).set_index("origin")
     for m in models:                                            # model-specific counts, e.g. regimes that fell back
         for (h, key), v in getattr(m, "extra_counts", {}).items():
             count[(m.name, h)][key] = v
