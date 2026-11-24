@@ -492,10 +492,12 @@ def hmm_summary(results: dict[str, WFResult]) -> pd.DataFrame:
     Per instrument: origins, refits, HMM failures (PRESPEC 6), the failure share and the flag for more than 10%, the mean K,
     and the quality of the fits. `hmm_not_converged` and `hmm_warnings` count refits (the refits that produced a new
     calibration; a failed refit keeps the previous one and is counted under hmm_failures), not origin days.
-    `share_refits_return_split` is the share of those refits in which the stress states differ from the others more in the
-    return than in the range feature, in standard deviations of the feature (see RegimeCalibration.diagnostics): such a
-    fit splits on the sign of the return, not on volatility. It is NaN unless the features are (log_return, a range feature)
-    and the regime table carries the diagnostics.
+    `share_refits_return_split` is the share of the fitted refits in which the stress states differ from the others more in
+    the return than in the range feature (absolute separations, in standard deviations of the feature; see
+    RegimeCalibration.diagnostics): such a fit splits on the sign of the return, not on volatility. A fit without a
+    separation (no stress state, as with k_bic at K = 1, no calm state, or a constant feature) has no side and is left out
+    of the share, so its denominator can be smaller than `refits` minus `hmm_failures`. The share is NaN unless the features
+    are (log_return, another feature) and the regime table carries the diagnostics.
     """
     rows = []
     for sym, r in results.items():

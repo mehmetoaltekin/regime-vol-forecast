@@ -185,8 +185,9 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
                     new = RegimeCalibration(regime_cfg).fit(X[anchor: t + 1])
                     if not np.isfinite(new.model.log_likelihood_):
                         raise ValueError("non-finite log-likelihood")
-                    cal, filt = new, new.filter(X[anchor: t + 1])
-                    diag = cal.diagnostics(X[anchor: t + 1], filt)
+                    new_filt = new.filter(X[anchor: t + 1])
+                    new_diag = new.diagnostics(X[anchor: t + 1], new_filt)
+                    cal, filt, diag = new, new_filt, new_diag       # the new fit replaces the old one only once all of it succeeded
                 except Exception as e:
                     if cal is None:
                         raise HmmFirstFitError(f"first HMM fit failed at {data.index[t].date()}: {e}") from e

@@ -43,9 +43,10 @@ def hmm_features(daily: pd.DataFrame, cfg: RegimeConfig = RegimeConfig()) -> pd.
     log_range_var (per-bar log Parkinson variance), volatility (rolling annualised Parkinson), and log_rv
     (log realised variance, for the information-matched check). Rows with a missing selected feature are dropped.
 
-    log_return is the daily return r_cc / 100 when the frame has one: it equals log(close / previous close) on every day
-    except the first retained day after an anchor day (PRESPEC 12.6), whose return is measured from the anchor's close and
-    not across the whole gap, as for RV, EWMA and GARCH. The first row has no previous close and is dropped either way.
+    log_return is the daily return r_cc / 100 when the frame has one: it equals log(close / previous close), up to rounding
+    in the last digits, on every day except the first retained day after an anchor day (PRESPEC 12.6), whose return is
+    measured from the anchor's close and not across the whole gap, as for RV, EWMA and GARCH. The first row has no previous
+    close and is dropped either way.
     """
     f = pd.DataFrame(index=daily.index)
     previous = daily["close"].shift(1)
@@ -95,7 +96,8 @@ class RegimeCalibration:
     def diagnostics(self, X: np.ndarray, filt: np.ndarray) -> dict[str, float | int]:
         """
         What the fit looks like, so that the label of the stress state can be audited after the run: the number of stress
-        states, the share of the training window that the filter puts in them, the log-likelihood, and for every feature
+        states, the share of the training window that the filter puts in them, the log-likelihood (the library's, on the
+        window's standardised features: comparable across K on one window, not across windows or feature sets), and for every feature
         `sep_<feature>`: the mean of the stress states minus the mean of the other states (both weighted by the window
         occupancy of the states), in standard deviations of that feature over the window. A stress state that differs
         from the others mainly in the return and not in the range is a split on the sign of the return, not a volatility regime.

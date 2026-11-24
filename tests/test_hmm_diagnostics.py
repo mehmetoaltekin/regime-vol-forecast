@@ -9,7 +9,7 @@ import rvf.study as S
 from rvf.models import all_models
 from rvf.realized import RVConfig, daily_measures, retained
 from rvf.regime import RegimeCalibration, RegimeConfig, hmm_features
-from rvf.walkforward import WFConfig, WFResult, run_walk_forward
+from rvf.walkforward import HmmFirstFitError, WFConfig, WFResult, refit_origins, run_walk_forward
 
 from conftest import make_daily
 from test_rules import PANEL, day_bars, series
@@ -171,3 +171,147 @@ def test_hmm_summary_reports_the_share_of_refits_that_split_on_the_return():
     assert np.isnan(summarise(g)["share_refits_return_split"])                         # a single feature has nothing to compare with
     g = regime_table(failed=[1], sep={"sep_log_return": [2.0] * 5, "sep_log_range_var": [1.0, 9.0, 1.0, 1.0, 1.0]})
     assert summarise(g)["share_refits_return_split"] == 1.0                            # the failed refit carries an old fit and is left out
+
+
+def test_hmm_summary_compares_magnitudes_and_only_a_return_with_one_other_feature():
+    """The criterion is |return separation| > |range separation|, with either sign; a table without that pair has no share."""
+    sep = {"sep_log_return": [0.5] * 5, "sep_log_range_var": [-2.0] * 5}
+    assert summarise(regime_table(sep=sep))["share_refits_return_split"] == 0.0        # a volatility split whose range separation is negative
+    sep = {"sep_log_return": [-0.5, 0.5, -3.0, 3.0, -0.5], "sep_log_range_var": [-2.0, 2.0, 1.0, -1.0, 0.4]}
+    assert summarise(regime_table(sep=sep))["share_refits_return_split"] == pytest.approx(3 / 5)     # refits 2, 3 and 4
+    assert np.isnan(summarise(regime_table(sep={"sep_log_return": [1.0] * 5}))["share_refits_return_split"])    # nothing to compare it with
+    swapped = regime_table(sep={"sep_volatility": [2.0] * 5, "sep_log_return": [5.0] * 5})
+    assert np.isnan(summarise(swapped)["share_refits_return_split"])                   # the return is not the first feature of the HMM
+
+
+# ------------------------------------------------------------------------------------------ the diagnostics through the engine
+
+DIAG = ["n_stress", "stress_occupancy", "hmm_loglik", "sep_log_return", "sep_log_range_var"]
+
+
+def m1_only():
+    return [m for m in all_models(min_ess=10, ms_starts=1) if m.name == "m1"]
+
+
+def fail_call(monkeypatch, name, call):
+    """The `call`-th call of RegimeCalibration.<name> raises."""
+    real, n = getattr(RegimeCalibration, name), {"n": 0}
+
+    def flaky(self, *a, **k):
+        n["n"] += 1
+        if n["n"] == call:
+            raise RuntimeError(f"{name} failed")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(RegimeCalibration, name, flaky)
+
+
+def test_a_failed_refit_keeps_the_diagnostics_of_the_fit_that_stays_in_force(monkeypatch):
+    """PRESPEC 6: the previous parameters are kept, so the row of a failed refit describes the previous fit, and it is not counted as a fit."""
+    d = make_daily(240, seed=4)
+    cfg = WFConfig(window=100, refit_every=40, horizons=(1,), burn_in=None)
+    fail_call(monkeypatch, "fit", 2)
+    res = run_walk_forward(d, m1_only(), cfg, FAST)
+    reg = res.regime
+    refits = list(reg.index[reg["refit"]])
+    assert len(refits) == 4 and list(reg.index[reg["hmm_failed"]]) == [refits[1]]
+    first = reg[DIAG].iloc[0]
+    kept = reg[DIAG][reg.index < refits[2]]                                            # from the first fit to the next successful refit
+    assert len(kept) > 40 and (kept == first).all().all()                              # the failed refit's row has the old numbers
+    loglik = reg["hmm_loglik"]
+    assert loglik.loc[refits[2]] != first["hmm_loglik"] and loglik.loc[refits[3]] != loglik.loc[refits[2]]   # a successful refit changes them
+    row = S.hmm_summary({"X": res}).iloc[0]
+    assert row["refits"] == 4 and row["hmm_failures"] == 1 and row["hmm_failure_share"] == 0.25
+    fitted = reg.loc[[refits[0], refits[2], refits[3]]]
+    assert row["share_refits_return_split"] == pytest.approx((fitted["sep_log_return"].abs() > fitted["sep_log_range_var"].abs()).mean())
+
+
+def test_an_error_in_the_diagnostics_is_a_failed_refit_like_any_other_and_leaves_the_state_whole(monkeypatch):
+    """The new fit replaces the old one only when everything about it succeeded; the filter is never half updated."""
+    d = make_daily(240, seed=4)
+    cfg = WFConfig(window=100, refit_every=40, horizons=(1,), burn_in=None)
+    with monkeypatch.context() as m:
+        fail_call(m, "fit", 2)
+        by_fit = run_walk_forward(d, m1_only(), cfg, FAST)
+    with monkeypatch.context() as m:
+        fail_call(m, "diagnostics", 2)
+        by_diagnostics = run_walk_forward(d, m1_only(), cfg, FAST)
+    assert by_fit.regime["hmm_failed"].sum() == 1
+    pd.testing.assert_frame_equal(by_diagnostics.regime, by_fit.regime)
+    pd.testing.assert_frame_equal(by_diagnostics.forecasts, by_fit.forecasts)
+    with monkeypatch.context() as m:
+        fail_call(m, "diagnostics", 1)                                                 # at the first refit this is the stop of PRESPEC 6
+        with pytest.raises(HmmFirstFitError, match="first HMM fit failed"):
+            run_walk_forward(d, m1_only(), cfg, FAST)
+
+
+def test_k_chosen_by_bic_gives_diagnostics_for_one_two_and_three_states_and_they_survive_the_parquet_round_trip(tmp_path):
+    d = make_daily(420, seed=0)
+    kb = RegimeConfig(n_components=(1, 2, 3), n_init=2)
+    cfg = WFConfig(window=150, refit_every=40, horizons=(1,), burn_in=None)
+    res = run_walk_forward(d, m1_only(), cfg, kb)
+    reg = res.regime
+    rows = reg[reg["refit"]]
+    assert set(rows["k"]) == {1, 2, 3} and set(rows["n_stress"]) == {0, 1, 2}          # one stress state at K = 2, one or two at K = 3
+    one = rows[rows["k"] == 1]
+    assert (one["n_stress"] == 0).all() and (one["stress_occupancy"] == 0).all() and one["hmm_loglik"].notna().all()
+    assert one[["sep_log_return", "sep_log_range_var"]].isna().all().all()             # no stress state: nothing to separate
+    many = rows[rows["k"] > 1]
+    assert (many["n_stress"] >= 1).all() and many[DIAG].notna().all().all() and many["stress_occupancy"].between(0, 1, inclusive="neither").all()
+    feats = hmm_features(d, kb)
+    X = feats.to_numpy()
+    for origin in rows.index:                                                          # each refit equals a direct fit on its own window
+        t = feats.index.get_loc(origin)
+        cal = RegimeCalibration(kb).fit(X[t - 149: t + 1])
+        direct = cal.diagnostics(X[t - 149: t + 1], cal.filter(X[t - 149: t + 1]))
+        assert cal.k == rows.loc[origin, "k"]
+        for c in DIAG:
+            assert reg.loc[origin, c] == pytest.approx(direct[c], rel=1e-9, nan_ok=True), (origin, c)
+    stamp = S.run_stamp("a" * 40, "b" * 64, "c" * 64, {})
+    S.save_task(res, tmp_path, "k_bic", "AAA", 1.0, stamp)
+    back, stopped = S.load_variant_results(tmp_path, "k_bic", ["AAA"], stamp["run_key"])
+    pd.testing.assert_frame_equal(back["AAA"].regime, reg)                             # same columns, dtypes (integer counts, NaN separations), index
+    row = S.hmm_summary(back).iloc[0]                                                  # K = 1 refits have no separation and are not in the share
+    assert row["refits"] == len(rows) and row["share_refits_return_split"] == pytest.approx(
+        (many["sep_log_return"].abs() > many["sep_log_range_var"].abs()).mean())
+
+
+def test_the_diagnostic_columns_follow_the_features_of_the_hmm():
+    d = make_daily(330, seed=7)
+    cfg = WFConfig(window=100, refit_every=60, horizons=(1,), burn_in=22)
+    rolling = run_walk_forward(d, m1_only(), cfg, RegimeConfig(vol_feature="rolling", vol_window=5, n_init=2)).regime
+    names = ["n_stress", "stress_occupancy", "hmm_loglik", "sep_log_return", "sep_volatility"]
+    assert list(rolling.columns[-5:]) == names and rolling[names].notna().all().all()
+    result = run_walk_forward(d, m1_only(), cfg, RegimeConfig(vol_feature="rolling", vol_window=5, n_init=2))
+    fitted = result.regime[result.regime["refit"]]
+    assert S.hmm_summary({"X": result}).iloc[0]["share_refits_return_split"] == pytest.approx(
+        (fitted["sep_log_return"].abs() > fitted["sep_volatility"].abs()).mean())
+    result = run_walk_forward(d, m1_only(), cfg, RegimeConfig(feature_cols=("log_rv",), sort_by="mean:0", n_init=2))
+    reg = result.regime
+    assert list(reg.columns[-4:]) == ["n_stress", "stress_occupancy", "hmm_loglik", "sep_log_rv"] and reg.iloc[:, -4:].notna().all().all()
+    assert (reg["sep_log_rv"] > 0).all()                                               # the stress state is the one with the higher log RV
+    assert np.isnan(S.hmm_summary({"X": result}).iloc[0]["share_refits_return_split"])  # one feature: no return split to report
+
+
+def test_the_return_of_an_anchor_day_reaches_the_hmm_through_the_engine_and_every_variant_keeps_it(monkeypatch):
+    """The HMM windows of the engine are cut from hmm_features of the frame it is given, so r_cc must be in that frame."""
+    d = make_daily(240, seed=4)
+    d.iloc[150, d.columns.get_loc("r_cc")] /= 4                                        # a day after an anchor: measured from the anchor's close
+    assert abs(100 * np.log(d["close"].iloc[150] / d["close"].iloc[149]) - d["r_cc"].iloc[150]) > 0.1
+    windows, real = [], RegimeCalibration.fit
+    monkeypatch.setattr(RegimeCalibration, "fit", lambda self, X: (windows.append(X.copy()), real(self, X))[1])
+    cfg = WFConfig(window=100, refit_every=40, horizons=(1,), burn_in=22)
+    run_walk_forward(d, m1_only(), cfg, FAST)
+    X = hmm_features(d, FAST).loc[d.index[22:]].to_numpy()
+    origins = list(refit_origins(len(X), cfg))
+    assert len(windows) == len(origins) >= 3
+    seen = 0
+    for w, o in zip(windows, origins):
+        assert np.array_equal(w, X[o - 99: o + 1])
+        if o - 99 <= 150 - 22 <= o:
+            assert w[150 - 22 - (o - 99), 0] == d["r_cc"].iloc[150] / 100
+            seen += 1
+    assert seen >= 2
+    bundle = d.assign(**{n: d["rv"] * 1.1 for n in (*S.ALT_TARGETS, *S.RANGE_TARGETS)})
+    for v in S.VARIANTS:
+        assert (S.variant_daily(bundle, v)["r_cc"] == bundle["r_cc"]).all(), v
