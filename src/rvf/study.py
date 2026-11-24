@@ -32,7 +32,7 @@ from rvf import models as M
 from rvf.data import RAW, CleanConfig, clean_m1, load_m1, raw_path
 from rvf.realized import RVConfig, daily_measures, retained
 from rvf.regime import RegimeConfig
-from rvf.walkforward import WFConfig, WFResult, run_walk_forward
+from rvf.walkforward import HmmFirstFitError, WFConfig, WFResult, run_walk_forward
 
 VARIANTS = ["primary", "rv_no_break", "rv_no_rollover", "rv_1min", "parkinson", "garman_klass", "hmm_rolling", "hmm_5bar",
             "k_bic", "log_har", "window_750", "window_1500", "long_history", "hmm_log_rv", "vintage", "harq"]
@@ -49,6 +49,8 @@ LOG_FAMILIES = {"H1": [("m5_log", "m3_log", "less")], "H2": [("m6_log", "m3_log"
                 "H3": [("m5_log", "m7_log", "two-sided"), ("m6_log", "m7_log", "two-sided")]}
 HARQ_FAMILIES = {"HARQ": [("m5_q", "m3_q", "less")]}
 GW_PAIRS = [("m5", "m3"), ("m6", "m3")]
+EQUITY_INDICES = {"US500", "USTEC", "DE40"}
+HMM_FAILURE_FLAG_SHARE = 0.10                       # PRESPEC 6: flag an instrument with more failures than this share of refits
 
 
 # ------------------------------------------------------------------------------------------------ configuration
@@ -60,6 +62,7 @@ class InstrumentSpec:
     end: str | None = None                    # last server day of the sample
     rv: dict = field(default_factory=dict)    # RVConfig fields (excluded_windows as a list of [start, end])
     asset_class: str = ""
+    clean: dict = field(default_factory=dict)  # CleanConfig fields other than start and end (bounce_sd, ...)
 
     def rv_config(self, **override) -> RVConfig:
         kw = dict(self.rv)
@@ -69,7 +72,7 @@ class InstrumentSpec:
         return RVConfig(**kw)
 
     def clean_config(self, start: str | None = None) -> CleanConfig:
-        return CleanConfig(start=start or self.start, end=self.end)
+        return CleanConfig(start=start or self.start, end=self.end, **self.clean)
 
 
 @dataclass
@@ -78,6 +81,7 @@ class StudyConfig:
     instruments: list[InstrumentSpec]
     window: int = 1000
     refit_every: int = 21
+    burn_in: int = 22
     horizons: tuple[int, ...] = (1, 5, 22)
     min_ess: float = 100.0
     ms_starts: int = 10
@@ -85,7 +89,7 @@ class StudyConfig:
     mcs_block: int = 10
     mcs_size: float = 0.10
     variants: tuple[str, ...] = tuple(VARIANTS)
-    long_history: dict = field(default_factory=dict)       # {"symbols": [...], "start": "YYYY-MM-DD"}
+    long_history: dict = field(default_factory=dict)       # symbol -> first day of its own minute data (check 6)
     seed: int = 0
 
     @classmethod
@@ -99,7 +103,24 @@ class StudyConfig:
         unknown = [v for v in cfg.variants if v not in VARIANTS]
         if unknown:
             raise ValueError(f"unknown variants: {unknown}")
+        cfg.validate_panel()
         return cfg
+
+    def validate_panel(self) -> None:
+        """PRESPEC 3 and 12.2: no equity index, at least four instruments from at least two asset classes."""
+        symbols = [i.symbol for i in self.instruments]
+        indices = sorted(set(symbols) & EQUITY_INDICES)
+        if indices:
+            raise ValueError(f"equity indices are not part of the study: {indices}")
+        if len(set(symbols)) != len(symbols):
+            raise ValueError("an instrument is listed twice")
+        classes = {i.asset_class for i in self.instruments}
+        if len(symbols) < 4 or len(classes) < 2:
+            raise ValueError(f"the panel needs at least four instruments from at least two asset classes "
+                             f"(got {len(symbols)} from {len(classes)})")
+        unknown = sorted(set(self.long_history) - set(symbols))
+        if unknown:
+            raise ValueError(f"long_history names instruments outside the panel: {unknown}")
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, default=list)
@@ -107,7 +128,7 @@ class StudyConfig:
 
 def variant_setup(name: str, cfg: StudyConfig) -> dict:
     """Models factory, walk-forward and regime configuration of one variant."""
-    wf = WFConfig(window=cfg.window, refit_every=cfg.refit_every, horizons=cfg.horizons)
+    wf = WFConfig(window=cfg.window, refit_every=cfg.refit_every, horizons=cfg.horizons, burn_in=cfg.burn_in)
     regime = RegimeConfig()
     factory: Callable[[], list] = lambda: M.all_models(cfg.min_ess, cfg.ms_starts)
     families = FAMILIES
@@ -177,14 +198,23 @@ def prepare_daily(spec: InstrumentSpec, variant: str = "primary", raw_dir: Path 
 
 # ------------------------------------------------------------------------------------------------ runs
 
-def run_variant(name: str, cfg: StudyConfig, daily: dict[str, pd.DataFrame], progress: Callable[[str], None] = print
-                ) -> dict[str, WFResult]:
-    """One variant on every instrument in `daily` (symbol -> retained daily rows, prepared for this variant)."""
+def run_variant(name: str, cfg: StudyConfig, daily: dict[str, pd.DataFrame], progress: Callable[[str], None] = print,
+                stopped: dict | None = None) -> dict[str, WFResult]:
+    """
+    One variant on every instrument in `daily` (symbol -> retained daily rows, prepared for this variant).
+    An instrument whose first HMM fit fails is stopped (PRESPEC 6): it is left out of the result and its reason is
+    written to `stopped` (without that dictionary the error is raised).
+    """
     setup = variant_setup(name, cfg)
     out = {}
     for sym, d in daily.items():
         progress(f"{name}: {sym} ({len(d)} days)")
-        out[sym] = run_walk_forward(d, setup["factory"](), setup["wf"], setup["regime"])
+        try:
+            out[sym] = run_walk_forward(d, setup["factory"](), setup["wf"], setup["regime"])
+        except HmmFirstFitError as e:
+            if stopped is None:
+                raise
+            stopped[sym] = str(e)
     return out
 
 
@@ -194,15 +224,30 @@ def _models(losses: pd.DataFrame) -> list[str]:
     return [m for m in losses.columns if m != "m0"]
 
 
+def hmm_summary(results: dict[str, WFResult]) -> pd.DataFrame:
+    """Per instrument: origins, refits, HMM failures (PRESPEC 6), the failure share and the flag for more than 10%."""
+    rows = []
+    for sym, r in results.items():
+        g = r.regime
+        refits = int(g["refit"].sum())
+        fails = int(g["hmm_failed"].sum())
+        share = fails / refits if refits else np.nan
+        rows.append(dict(instrument=sym, origins=len(g), refits=refits, hmm_failures=fails, hmm_failure_share=share,
+                         flag_failures_over_10pct=bool(share > HMM_FAILURE_FLAG_SHARE), share_stress=float((g["prob_stress"] > 0.5).mean()),
+                         mean_k=float(g["k"].mean()), hmm_not_converged=int((~g["hmm_converged"]).sum()),
+                         hmm_warnings=int(g["hmm_warnings"].sum())))
+    return pd.DataFrame(rows)
+
+
 def evaluate_run(results: dict[str, WFResult], cfg: StudyConfig, families: dict | None = None, loss: str = "qlike",
-                 pooled: bool = True, extras: bool = True) -> dict[str, pd.DataFrame]:
+                 pooled: bool = True, extras: bool = True, effects: bool = True) -> dict[str, pd.DataFrame]:
     """
     Evaluation tables of one variant. Every table is long-format. Tests use the loss differential
     loss(model a) - loss(model b) on the days where all models of an instrument have a forecast.
     """
     families = families or FAMILIES
     horizons = sorted({h for r in results.values() for h in r.forecasts.index.get_level_values("h").unique()})
-    mean_rows, dm_rows, pooled_rows, mcs_rows, gw_rows, split_rows = [], [], [], [], [], []
+    mean_rows, dm_rows, pooled_rows, mcs_rows, gw_rows, split_rows, effect_rows = [], [], [], [], [], [], []
     for h in horizons:
         tabs = {s: E.loss_table(r.forecasts, h, loss) for s, r in results.items()}
         for s, t in tabs.items():
@@ -220,6 +265,15 @@ def evaluate_run(results: dict[str, WFResult], cfg: StudyConfig, families: dict 
                     r = E.dm_test(d.to_numpy(), h=h, alternative=alt)
                     fam_rows.append(dict(h=h, family=fam, comparison=f"{a} vs {b}", alternative=alt, instrument=s,
                                          mean_diff=r["mean"], stat=r["stat"], pvalue=r["pvalue"], n=r["n"], lag=r["lag"]))
+                if effects and loss == "qlike":                      # PRESPEC 8.6: model a against reference b
+                    base = dict(h=h, family=fam, model=a, reference=b)
+                    for s_, t in tabs.items():
+                        if a in t and b in t:
+                            effect_rows.append(dict(base, scope=s_, **E.effect_size(t[b], t[a], h=h)))
+                    if len(tabs) > 1:
+                        effect_rows.append(dict(base, scope="pooled", **E.pooled_effect_size(
+                            pd.DataFrame({s_: t[b] for s_, t in tabs.items() if a in t and b in t}),
+                            pd.DataFrame({s_: t[a] for s_, t in tabs.items() if a in t and b in t}), h=h)))
                 if pooled and len(diffs) > 1:
                     r = E.pooled_dm(pd.DataFrame(diffs), h=h, alternative=alt)
                     pooled_rows.append(dict(h=h, family=fam, comparison=f"{a} vs {b}", alternative=alt, mean_diff=r["mean"],
@@ -248,11 +302,7 @@ def evaluate_run(results: dict[str, WFResult], cfg: StudyConfig, families: dict 
             sp.insert(0, "h", h)
             split_rows.append(sp)
     counters = pd.concat([r.counters.assign(instrument=s) for s, r in results.items()], ignore_index=True)
-    regime = pd.concat([r.regime.assign(instrument=s) for s, r in results.items() if r.regime is not None and len(r.regime)])
-    regime_summary = regime.groupby("instrument").agg(
-        origins=("prob_stress", "size"), share_stress=("prob_stress", lambda x: float((x > 0.5).mean())), refits=("refit", "sum"),
-        mean_k=("k", "mean"), hmm_not_converged=("hmm_converged", lambda x: int((~x).sum())),
-        hmm_warnings=("hmm_warnings", "sum")).reset_index() if len(regime) else pd.DataFrame()
+    regime_summary = hmm_summary(results)
     tables = {"mean_loss": pd.DataFrame(mean_rows), "counters": counters, "regime_summary": regime_summary}
     if dm_rows:
         tables["dm_by_instrument"] = pd.concat(dm_rows, ignore_index=True)
@@ -264,6 +314,8 @@ def evaluate_run(results: dict[str, WFResult], cfg: StudyConfig, families: dict 
         tables["gw_conditional"] = pd.DataFrame(gw_rows)
     if split_rows:
         tables["loss_splits"] = pd.concat(split_rows, ignore_index=True)
+    if effect_rows:
+        tables["effect_sizes"] = pd.DataFrame(effect_rows)
     return tables
 
 

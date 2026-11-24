@@ -112,6 +112,52 @@ def pooled_dm(d: pd.DataFrame, h: int = 1, alternative: str = "two-sided") -> di
     return out
 
 
+def effect_size(l_ref, l_model, h: int = 1, hln: bool = True, level: float = 0.95) -> dict:
+    """
+    Size of a loss difference (PRESPEC 8.6). d = L(reference) - L(model), so positive values favour the model.
+    Relative improvement = mean(d) / mean(L(reference)) in percent. The confidence interval uses the Newey-West
+    variance of d (lag max(h - 1, 5)) as the Diebold-Mariano test does: with hln the Harvey-Leybourne-Newbold factor and
+    Student-t(n - 1) critical values (per instrument), without it normal critical values (pooled). The reference's mean
+    loss is treated as fixed. If the confidence interval excludes zero, the two-sided test of the same d rejects.
+    """
+    ref, mod = np.asarray(l_ref, dtype=float), np.asarray(l_model, dtype=float)
+    ok = np.isfinite(ref) & np.isfinite(mod)
+    ref, d = ref[ok], ref[ok] - mod[ok]
+    n = len(d)
+    out = {"n": n, "mean_d": np.nan, "ref_mean_loss": np.nan, "rel_improvement_pct": np.nan, "ci_low_pct": np.nan,
+           "ci_high_pct": np.nan, "se_d": np.nan, "lag": default_lag(h)}
+    if n < 3:
+        return out
+    lrv = long_run_variance(d, out["lag"])
+    se = np.sqrt(lrv / n)
+    if hln:
+        se /= np.sqrt((n + 1 - 2 * h + h * (h - 1) / n) / n)
+        crit = stats.t(df=n - 1).ppf(0.5 + level / 2)
+    else:
+        crit = stats.norm.ppf(0.5 + level / 2)
+    mean_d, ref_mean = float(d.mean()), float(ref.mean())
+    out.update(mean_d=mean_d, ref_mean_loss=ref_mean, se_d=float(se), rel_improvement_pct=100 * mean_d / ref_mean,
+               ci_low_pct=100 * (mean_d - crit * se) / ref_mean, ci_high_pct=100 * (mean_d + crit * se) / ref_mean)
+    return out
+
+
+def pooled_effect_size(l_ref: pd.DataFrame, l_model: pd.DataFrame, h: int = 1, level: float = 0.95) -> dict:
+    """
+    Pooled version: d_t is the average over the instruments that have both losses on day t (the series of PRESPEC 8.2),
+    the reference loss is averaged over the same instruments, and the test is the pooled one (normal critical values).
+    Both frames have one row per day and one column per instrument.
+    """
+    cols = l_ref.columns.intersection(l_model.columns)
+    ref, mod = l_ref[cols], l_model[cols]
+    both = ref.notna() & mod.notna()
+    day = both.any(axis=1)
+    ref_bar = ref.where(both).mean(axis=1)[day]
+    d_bar = (ref - mod).where(both).mean(axis=1)[day]
+    out = effect_size(ref_bar.to_numpy(), (ref_bar - d_bar).to_numpy(), h=h, hln=False, level=level)
+    out["instruments_per_day"] = float(both[day].sum(axis=1).mean())
+    return out
+
+
 def holm(pvalues) -> np.ndarray:
     """Holm step-down adjusted p-values, in the order given."""
     p = np.asarray(pvalues, dtype=float)

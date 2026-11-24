@@ -19,7 +19,8 @@ import run_study as R  # noqa: E402
 
 
 def small_cfg(**kw) -> S.StudyConfig:
-    base = dict(prespec_version="t", instruments=[S.InstrumentSpec("AAA"), S.InstrumentSpec("BBB")], window=120,
+    panel = [S.InstrumentSpec(s, asset_class=c) for s, c in (("AAA", "FX"), ("BBB", "FX"), ("CCC", "Metals"), ("DDD", "Metals"))]
+    base = dict(prespec_version="t", instruments=panel, window=120,
                 refit_every=40, horizons=(1, 5), min_ess=20, ms_starts=1, mcs_reps=100, mcs_block=5)
     base.update(kw)
     return S.StudyConfig(**base)
@@ -48,7 +49,8 @@ def primary():
 def test_evaluation_tables(primary):
     cfg, res = primary
     t = S.evaluate_run(res, cfg)
-    assert set(t) == {"mean_loss", "counters", "regime_summary", "dm_by_instrument", "dm_pooled", "mcs", "gw_conditional", "loss_splits"}
+    assert set(t) == {"mean_loss", "counters", "regime_summary", "dm_by_instrument", "dm_pooled", "mcs", "gw_conditional", "loss_splits",
+                      "effect_sizes"}
     dm = t["dm_by_instrument"]
     assert set(dm["family"]) == {"H1", "H2", "M4_vs_M2c", "H3"} and set(dm["h"]) == {1, 5}
     assert (dm["pvalue_holm"] >= dm["pvalue"] - 1e-12).all() and (dm["pvalue_holm"] <= 1).all()
@@ -150,14 +152,14 @@ def test_prepare_daily_target_variants_and_development_cut(tmp_path):
 
 
 def test_config_round_trip(tmp_path):
-    cfg = small_cfg(instruments=[S.InstrumentSpec("US500", "2017-04-18", "2026-10-31",
-                                                  {"excluded_windows": [[1380, 1440]], "median_day_length": 275.0}, "Equity indices")],
-                    long_history={"symbols": ["US500"], "start": "2012-08-06"}, variants=("primary", "harq"))
+    panel = [S.InstrumentSpec(s, "2008-11-10", "2026-10-31", {"excluded_windows": [[1380, 60]], "median_day_length": 264.0}, c)
+             for s, c in (("XAUUSD", "Precious metals"), ("XAGUSD", "Precious metals"), ("EURUSD", "FX"), ("USDJPY", "FX"))]
+    cfg = small_cfg(instruments=panel, long_history={"XAUUSD": "2004-06-14"}, variants=("primary", "harq"))
     p = tmp_path / "c.json"
     p.write_text(cfg.to_json())
     back = S.StudyConfig.from_json(p)
-    assert back.instruments[0].rv_config().excluded_windows == ((1380, 1440),) and back.variants == ("primary", "harq")
-    assert back.horizons == (1, 5) and back.long_history["start"] == "2012-08-06"
+    assert back.instruments[0].rv_config().excluded_windows == ((1380, 60),) and back.variants == ("primary", "harq")
+    assert back.horizons == (1, 5) and back.long_history == {"XAUUSD": "2004-06-14"} and back.burn_in == 22
     p.write_text(cfg.to_json().replace('"harq"', '"nonsense"'))
     with pytest.raises(ValueError, match="unknown variants"):
         S.StudyConfig.from_json(p)
@@ -205,7 +207,7 @@ def test_raw_data_hashes_are_verified(tmp_path):
         R.verify_raw_hashes(["ZZZ"], tmp_path, table)
 
 
-def test_full_run_refuses_a_dirty_tree_a_second_run_and_a_draft(tmp_path, monkeypatch):
+def test_full_run_refuses_without_tag_dirty_tree_second_run_and_draft(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     (repo / "results").mkdir(parents=True)
     run = lambda *a: subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True)
@@ -213,16 +215,25 @@ def test_full_run_refuses_a_dirty_tree_a_second_run_and_a_draft(tmp_path, monkey
     run("config", "user.email", "t@example.com")
     run("config", "user.name", "t")
     (repo / "tracked.txt").write_text("x")
-    run("add", "tracked.txt")
+    write_prespec(repo / "PRESPEC.md", "1.0", "Approved")
+    run("add", "tracked.txt", "PRESPEC.md")
     run("commit", "-q", "-m", "x")
-    write_prespec(repo / "PRESPEC.md", "0.3", "Approved")
-    cfg = small_cfg(prespec_version="0.3")
+    cfg = small_cfg(prespec_version="1.0")
     cfg_path = repo / "cfg.json"
     cfg_path.write_text(cfg.to_json())
     monkeypatch.setattr(R, "ROOT", repo)
     monkeypatch.setattr(R, "RESULTS", repo / "results")
     commit, dirty = R.git_state()
     assert len(commit) == 40 and dirty == []
+    with pytest.raises(SystemExit, match="no tag prespec-v1.0"):                     # approved text, but not tagged
+        R.run_full(cfg_path)
+    run("tag", "prespec-v1.0")
+    R.check_tag()
+    write_prespec(repo / "PRESPEC.md", "1.0", "Approved, edited after the tag")
+    run("commit", "-qam", "edit after the tag")
+    with pytest.raises(SystemExit, match="differs from PRESPEC.md at tag"):
+        R.run_full(cfg_path)
+    run("tag", "-f", "prespec-v1.0")                                                  # re-tag: the edit is now the tagged text
     (repo / "tracked.txt").write_text("changed")
     assert R.git_state()[1] == [" M tracked.txt"]
     with pytest.raises(SystemExit, match="uncommitted changes"):
@@ -238,8 +249,14 @@ def test_full_run_refuses_a_dirty_tree_a_second_run_and_a_draft(tmp_path, monkey
     with pytest.raises(SystemExit, match="started before"):
         R.run_full(cfg_path)
     (repo / "results" / "RUN_INFO.md").unlink()
-    write_prespec(repo / "PRESPEC.md", "0.3", "DRAFT")
-    with pytest.raises(SystemExit, match="DRAFT"):
+    for version, status, message in (("0.4", "Approved", "needs 1.0 or later"), ("1.0", "DRAFT", "DRAFT")):
+        write_prespec(repo / "PRESPEC.md", version, status)
+        cfg_path.write_text(small_cfg(prespec_version=version).to_json())
+        with pytest.raises(SystemExit, match=message):
+            R.run_full(cfg_path)
+    write_prespec(repo / "PRESPEC.md", "1.0", "Approved")
+    cfg_path.write_text(small_cfg(prespec_version="0.4").to_json())
+    with pytest.raises(SystemExit, match="configuration is for PRESPEC 0.4"):
         R.run_full(cfg_path)
     assert not (repo / "results" / "RUN_STARTED.lock").exists()                      # a refused run leaves nothing behind
 

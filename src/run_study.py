@@ -5,8 +5,9 @@ Run the study.
     python src/run_study.py --full --config FILE.json  # the one full run, on frozen code
 
 The full run refuses to start unless
-  - PRESPEC.md is approved: its version is at least 0.3 and its status line no longer says DRAFT, and the
-    configuration file names the same version,
+  - PRESPEC.md is approved: its version is 1.0 or later, its status line no longer says DRAFT, the configuration
+    file names the same version, and the repo has the tag prespec-v1.0 on a commit whose PRESPEC.md equals the
+    current one,
   - the working tree has no uncommitted change in tracked files (the commit hash goes into results/RUN_INFO.md),
   - the SHA-256 of every raw data file equals the one stored in results/raw_data_sha256.tsv,
   - neither results/RUN_INFO.md nor results/RUN_STARTED.lock exists: the run happens once. If a run stopped half
@@ -36,6 +37,9 @@ from rvf import study as S  # noqa: E402
 from rvf.data import RAW  # noqa: E402
 
 RESULTS = ROOT / "results"
+CONFIG = ROOT / "config" / "study_config.json"
+TAG = "prespec-v1.0"
+MINIMUM_VERSION = (1, 0)
 PACKAGES = ["numpy", "pandas", "scipy", "statsmodels", "arch", "hmm-regime", "hmmlearn", "matplotlib", "pyarrow"]
 
 
@@ -53,17 +57,26 @@ def version_tuple(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in v.split("."))
 
 
-def check_prespec(path: Path, config_version: str) -> str:
+def check_prespec(path: Path, config_version: str, minimum: tuple[int, ...] = (0, 3)) -> str:
     if not path.exists():
         raise SystemExit("REFUSED: no PRESPEC.md")
     version, status = prespec_status(path)
-    if version_tuple(version) < (0, 3):
-        raise SystemExit(f"REFUSED: PRESPEC.md is version {version}; the full run needs 0.3 or later")
+    if version_tuple(version) < minimum:
+        raise SystemExit(f"REFUSED: PRESPEC.md is version {version}; the full run needs "
+                         f"{'.'.join(map(str, minimum))} or later")
     if "DRAFT" in status.upper():
         raise SystemExit(f"REFUSED: PRESPEC.md still says DRAFT ({status})")
     if config_version != version:
         raise SystemExit(f"REFUSED: the configuration is for PRESPEC {config_version}, PRESPEC.md is {version}")
     return version
+
+
+def check_tag(tag: str = TAG) -> None:
+    """The approved PRESPEC.md must be committed and tagged, and unchanged since the tag."""
+    if subprocess.run(["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"], cwd=ROOT, capture_output=True).returncode:
+        raise SystemExit(f"REFUSED: the repo has no tag {tag}")
+    if subprocess.run(["git", "diff", "--quiet", tag, "HEAD", "--", "PRESPEC.md"], cwd=ROOT).returncode:
+        raise SystemExit(f"REFUSED: PRESPEC.md at HEAD differs from PRESPEC.md at tag {tag}")
 
 
 def git(*args: str) -> str:
@@ -97,17 +110,26 @@ def verify_raw_hashes(symbols: list[str], raw_dir: Path = RAW, table: Path = RES
     return used
 
 
+DEV_START, DEV_END = "2017-03-21", "2021-02-04"       # PRESPEC 12.8: the first training window of US500
+
+
 def dev_config() -> S.StudyConfig:
-    """Development set-up: US500, a smaller window so that forecasts exist inside the first training window."""
-    return S.StudyConfig(prespec_version="dev", instruments=[S.InstrumentSpec("US500", start="2017-03-21")],
-                         window=500, refit_every=100, horizons=(1, 5), ms_starts=3, mcs_reps=300, variants=("primary",))
+    """
+    Development set-up: US500 between DEV_START and DEV_END with the same rules as the panel (taken from the study
+    configuration), a smaller window so that forecasts exist inside the window. US500 is not in the study panel.
+    """
+    rules = S.StudyConfig.from_json(CONFIG).instruments[0]
+    spec = S.InstrumentSpec("US500", DEV_START, DEV_END, dict(rules.rv), "development only", dict(rules.clean))
+    return S.StudyConfig("dev", [spec], window=500, refit_every=100, horizons=(1, 5), ms_starts=3, mcs_reps=300,
+                         variants=("primary",))             # built directly: an index would fail the panel validation
 
 
-def run_dev(max_days: int = 1000) -> None:
+def run_dev() -> None:
     cfg = dev_config()
     out = RESULTS / "dev"
-    daily = {s.symbol: S.prepare_daily(s, "primary", max_days=max_days) for s in cfg.instruments}
+    daily = {s.symbol: S.prepare_daily(s, "primary") for s in cfg.instruments}
     for s, d in daily.items():
+        assert d.index[-1] <= pd.Timestamp(DEV_END)
         print(f"{s}: {len(d)} retained days {d.index[0].date()} .. {d.index[-1].date()} (development window only)")
     res = S.run_variant("primary", cfg, daily)
     tables = S.evaluate_run(res, cfg)
@@ -118,7 +140,8 @@ def run_dev(max_days: int = 1000) -> None:
 
 def run_full(config_path: Path) -> None:
     cfg = S.StudyConfig.from_json(config_path)
-    version = check_prespec(ROOT / "PRESPEC.md", cfg.prespec_version)
+    version = check_prespec(ROOT / "PRESPEC.md", cfg.prespec_version, MINIMUM_VERSION)
+    check_tag()
     if (RESULTS / "RUN_INFO.md").exists() or (RESULTS / "RUN_STARTED.lock").exists():
         raise SystemExit("REFUSED: the full run has been started before (results/RUN_INFO.md or RUN_STARTED.lock exists)")
     commit, dirty = git_state()
@@ -132,12 +155,19 @@ def run_full(config_path: Path) -> None:
     summary = []
     for name in cfg.variants:
         specs = cfg.instruments
-        start = None
-        if name == "long_history":
-            specs = [s for s in cfg.instruments if s.symbol in cfg.long_history["symbols"]]
-            start = cfg.long_history["start"]
-        daily = {s.symbol: S.prepare_daily(s, name, start=start) for s in specs}
-        res = S.run_variant(name, cfg, daily)
+        starts = {}
+        if name == "long_history":                              # check 6: each instrument on its own minute-data history
+            specs = [s for s in cfg.instruments if s.symbol in cfg.long_history]
+            starts = cfg.long_history
+        daily = {s.symbol: S.prepare_daily(s, name, start=starts.get(s.symbol)) for s in specs}
+        stopped: dict = {}
+        res = S.run_variant(name, cfg, daily, stopped=stopped)
+        if stopped:                                             # PRESPEC 6: first HMM fit failed, instrument stopped
+            (RESULTS / "tables").mkdir(parents=True, exist_ok=True)
+            pd.DataFrame({"instrument": list(stopped), "reason": list(stopped.values())}).to_csv(
+                RESULTS / "tables" / f"{name}__stopped_instruments.csv", index=False)
+        if not res:
+            continue
         setup = S.variant_setup(name, cfg)
         tables = S.evaluate_run(res, cfg, families=setup["families"])
         S.write_tables(tables, RESULTS / "tables", name)

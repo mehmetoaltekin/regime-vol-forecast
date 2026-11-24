@@ -28,6 +28,11 @@ class WFConfig:
     target: str = "rv"                       # column holding the daily variance measure
     insanity_filter: bool = True
     vintage_training: bool = False           # robustness check 9: train M4-M6 on the probabilities as computed on each day
+    burn_in: int | None = None               # PRESPEC 7: leading days used only for features and lags (None: earlier behaviour)
+
+
+class HmmFirstFitError(RuntimeError):
+    """The HMM could not be estimated at the first refit of an instrument (PRESPEC 6): the instrument is stopped."""
 
 
 @dataclass
@@ -111,7 +116,7 @@ def refit_origins(n: int, cfg: WFConfig) -> np.ndarray:
 @dataclass
 class WFResult:
     forecasts: pd.DataFrame                   # index (target_day, model); columns h, origin, forecast, raw, target, source
-    regime: pd.DataFrame                      # per origin: real-time prob_stress, K, refit flag, HMM fit status
+    regime: pd.DataFrame                      # per origin: real-time prob_stress, K, refit flag, HMM fit status and failure
     counters: pd.DataFrame                    # per model and horizon: refits, failures, fallbacks, insanity replacements
     details: dict = field(default_factory=dict)
 
@@ -122,13 +127,26 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
     daily: retained trading days (rvf.realized.retained) with at least open/high/low/close and the target column.
     regime_cfg=None runs without an HMM (models must not ask for regime probabilities).
     """
-    if regime_cfg is not None:
-        feats = hmm_features(daily, regime_cfg)
-        data = daily.loc[feats.index]
-        X = feats.to_numpy()
+    if cfg.burn_in is not None:
+        # the first burn_in days only supply lags and features: HAR averages and HMM features of the first training
+        # day are built from them, and every run starts its first window on the same day
+        data = daily.join(har_columns(daily[cfg.target])).iloc[cfg.burn_in:]
+        X = None
+        if regime_cfg is not None:
+            feats = hmm_features(daily, regime_cfg)
+            missing = data.index.difference(feats.index)
+            if len(missing):
+                raise ValueError(f"{len(missing)} days after the burn-in have no HMM feature (first: {missing[0].date()}); "
+                                 "the burn-in is too short for this feature")
+            X = feats.loc[data.index].to_numpy()
     else:
-        data, X = daily, None
-    data = data.join(har_columns(data[cfg.target]))
+        if regime_cfg is not None:
+            feats = hmm_features(daily, regime_cfg)
+            data = daily.loc[feats.index]
+            X = feats.to_numpy()
+        else:
+            data, X = daily, None
+        data = data.join(har_columns(data[cfg.target]))
     n = len(data)
     if n <= cfg.window:
         raise ValueError(f"{n} days are not enough for a window of {cfg.window}")
@@ -159,18 +177,29 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
 
     for t in range(cfg.window - 1, n - 1):
         refit = t in refits
+        hmm_failed = False
         if refit:
             anchor = t - cfg.window + 1
             if regime_cfg is not None:
-                cal = RegimeCalibration(regime_cfg).fit(X[anchor: t + 1])
-                filt = cal.filter(X[anchor: t + 1])
+                try:
+                    new = RegimeCalibration(regime_cfg).fit(X[anchor: t + 1])
+                    if not np.isfinite(new.model.log_likelihood_):
+                        raise ValueError("non-finite log-likelihood")
+                    cal, filt = new, new.filter(X[anchor: t + 1])
+                except Exception as e:
+                    if cal is None:
+                        raise HmmFirstFitError(f"first HMM fit failed at {data.index[t].date()}: {e}") from e
+                    # keep the previous parameters and carry the filter on from yesterday's state; the window of the
+                    # models is the new one, so the filtered series is cut to the same number of days
+                    hmm_failed = True
+                    filt = np.vstack([filt, cal.filter(X[t: t + 1], prior=filt[-1])])[-cfg.window:]
         elif regime_cfg is not None:
             filt = np.vstack([filt, cal.filter(X[t: t + 1], prior=filt[-1])])
         win = Window(data.iloc[anchor: t + 1], cfg.window, filt, *(
             (cal.A, cal.stress, cal.state_var) if cal is not None else (None, None, None)), cfg.target)
         if regime_cfg is not None:
             regime_rows.append((data.index[t], float(win.p[-1]), cal.k, refit, bool(cal.model.converged_),
-                                len(cal.model.warnings_)))
+                                len(cal.model.warnings_), hmm_failed))
             vintage[data.index[t]] = filt[-1].copy()            # filtered vector as computed on day t
             if vp_all is not None:
                 vp_all[t] = win.p[-1]
@@ -205,8 +234,8 @@ def run_walk_forward(daily: pd.DataFrame, models: list, cfg: WFConfig = WFConfig
                 rows.append((data.index[t + 1], m.name, h, data.index[t], final, f, target, source))
 
     fc = pd.DataFrame(rows, columns=["target_day", "model", "h", "origin", "forecast", "raw", "target", "source"])
-    regime = pd.DataFrame(regime_rows, columns=["origin", "prob_stress", "k", "refit", "hmm_converged", "hmm_warnings"]
-                          ).set_index("origin")
+    regime = pd.DataFrame(regime_rows, columns=["origin", "prob_stress", "k", "refit", "hmm_converged", "hmm_warnings",
+                                                "hmm_failed"]).set_index("origin")
     for m in models:                                            # model-specific counts, e.g. regimes that fell back
         for (h, key), v in getattr(m, "extra_counts", {}).items():
             count[(m.name, h)][key] = v
