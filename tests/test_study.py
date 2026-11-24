@@ -316,6 +316,23 @@ def test_a_new_run_refuses_to_start_on_results_of_earlier_code(tmp_path, monkeyp
         R.run_full(cfg_path, resume=True)
 
 
+@pytest.mark.parametrize("field, label", [("commit", "commit"), ("config_sha256", "configuration"), ("prespec_sha256", "PRESPEC.md")])
+def test_resume_refuses_a_lock_of_another_commit_configuration_or_prespec(tmp_path, monkeypatch, field, label):
+    """A changed code base, configuration or specification voids the finished tasks, so --resume does not continue the run."""
+    import json
+    repo, cfg, cfg_path = approved_repo(tmp_path, monkeypatch)
+    lock = {"started": "2026-12-01T00:00:00+00:00", "commit": R.git_state()[0], "config_sha256": R.sha256(cfg_path),
+            "prespec_sha256": R.sha256(repo / "PRESPEC.md"), "bundle_hashes": {}, "run_key": "x"}
+    monkeypatch.setattr(R, "verify_raw_hashes", lambda *a, **k: {})
+    lock[field] = "0" * 64
+    (repo / "results" / "RUN_STARTED.lock").write_text(json.dumps(lock))
+    with pytest.raises(SystemExit, match=f"REFUSED: the {label} is not the one the run was started with"):
+        R.run_full(cfg_path, resume=True)
+    (repo / "results" / "RUN_STARTED.lock").write_text('{"started": "2026-12-0')        # a lock cut short cannot be trusted either
+    with pytest.raises(SystemExit, match="lock cannot be read"):
+        R.run_full(cfg_path, resume=True)
+
+
 def test_resume_refuses_daily_rows_that_differ_from_those_of_the_started_run(tmp_path, monkeypatch):
     """The finished tasks were computed from the daily rows named in the lock; other rows void them."""
     import json
