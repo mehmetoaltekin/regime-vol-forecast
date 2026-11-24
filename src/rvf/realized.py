@@ -18,6 +18,11 @@ Definitions (server time; returns in percent, variances in percent squared):
   RQ              Realised quarticity (n / 3) * sum of fourth powers of the n grid returns.
   short day       A day whose number of grid returns is below short_day_share times the median day length. Short
                   days are removed; their price move goes into the next retained day's session-break return.
+  stale day       A day on which more than stale_share of the one-minute returns between bars outside the excluded
+                  windows (consecutive minutes) are exactly zero. Removed like a short day.
+  anchor day      A day whose previous candidate day (neither short nor stale) lies more than anchor_gap_days calendar
+                  days earlier. It gets no RV and no return and is not part of the daily series, but its close is the
+                  price anchor of the next day's returns.
 """
 from __future__ import annotations
 
@@ -40,6 +45,8 @@ class RVConfig:
     median_day_length: float | None = None               # fixed in advance; None: median of the sample given,
                                                          # which makes early days depend on later data
     ohlc_from_included: bool = False                     # True: daily open/high/low/close ignore excluded windows
+    stale_share: float | None = None                     # None: no stale-day rule
+    anchor_gap_days: int | None = None                   # None: no anchor rule
 
 
 def excluded_mask(windows: tuple[tuple[int, int], ...]) -> np.ndarray:
@@ -80,9 +87,10 @@ def daily_measures(m1: pd.DataFrame, cfg: RVConfig = RVConfig()) -> pd.DataFrame
     use = inc if cfg.ohlc_from_included else np.ones(len(m1), dtype=bool)
     g = pd.DataFrame({"tday": tday, "open": m1["open"].to_numpy(), "high": m1["high"].to_numpy(),
                       "low": m1["low"].to_numpy(), "close": m1["close"].to_numpy()})
+    all_days = pd.Index(np.unique(tday), name="tday")        # a day with no bar outside the windows keeps its row
     out = g[use].groupby("tday", sort=True).agg(open=("open", "first"), high=("high", "max"), low=("low", "min"),
-                                                 close=("close", "last"))
-    out["bars"] = g.groupby("tday").size().reindex(out.index)
+                                                 close=("close", "last")).reindex(all_days)
+    out["bars"] = g.groupby("tday").size().reindex(all_days)
 
     # grid prices: last included close per (trading day, segment, grid point)
     seg_of = np.cumsum(np.tile(excl, 2))                    # constant between excluded minutes, over [-1440, 1440)
@@ -112,10 +120,30 @@ def daily_measures(m1: pd.DataFrame, cfg: RVConfig = RVConfig()) -> pd.DataFrame
         median = cfg.median_day_length if cfg.median_day_length is not None else float(length.median())
         out["short"] = length < cfg.short_day_share * median
 
-    # close-to-close and session-break returns along the retained days
-    keep = ~out["short"]
-    prev_close = out.loc[keep, "close"].shift(1)
-    out["r_cc"] = 100.0 * np.log(out.loc[keep, "close"] / prev_close)
+    # stale days: one-minute returns between consecutive bars outside the excluded windows
+    out["zero_share"] = np.nan
+    out["stale"] = False
+    if cfg.stale_share is not None:
+        ti, ci, di = ts.to_numpy()[inc], m1["close"].to_numpy(dtype=float)[inc], tday[inc]
+        step = (np.diff(ti) == np.timedelta64(1, "m")) & (di[1:] == di[:-1])
+        zero = step & (ci[1:] == ci[:-1])
+        cnt = pd.DataFrame({"tday": di[1:], "step": step, "zero": zero}).groupby("tday").sum()
+        share = (cnt["zero"] / cnt["step"].where(cnt["step"] > 0)).reindex(out.index)
+        out["zero_share"] = share
+        out["stale"] = (share > cfg.stale_share).fillna(False).astype(bool)
+
+    # candidates are neither short nor stale; an anchor day follows a gap of more than anchor_gap_days
+    cand = ~out["short"] & ~out["stale"]
+    out["anchor"] = False
+    if cfg.anchor_gap_days is not None:
+        cdates = pd.Series(out.index[cand], index=out.index[cand])
+        out.loc[cdates.index[(cdates.diff().dt.days > cfg.anchor_gap_days).to_numpy()], "anchor"] = True
+    keep = cand & ~out["anchor"]
+
+    # close-to-close and session-break returns: the previous candidate (anchors included) supplies the previous close
+    prev_close = out.loc[cand, "close"].shift(1)
+    r_all = 100.0 * np.log(out.loc[cand, "close"] / prev_close)
+    out["r_cc"] = r_all.where(keep.loc[cand]).reindex(out.index)
     out["r_break"] = out["r_cc"] - out["sum_r"]
     out["rv"] = out["rv_intraday"] + out["r_break"] ** 2 if cfg.include_session_break else out["rv_intraday"]
     out["rq"] = out["n_returns"] / 3.0 * out["sum_r4"]
@@ -123,13 +151,20 @@ def daily_measures(m1: pd.DataFrame, cfg: RVConfig = RVConfig()) -> pd.DataFrame
     out["parkinson"] = parkinson(out["high"], out["low"])
     out["garman_klass"] = garman_klass(out["open"], out["high"], out["low"], out["close"])
     out.loc[~keep, ["parkinson", "garman_klass"]] = np.nan
+    out["kept"] = keep & out["r_cc"].notna()                 # the first candidate has no previous close and no return
     out.index.name = "tday"
     return out
 
 
+FLAG_COLUMNS = ["short", "stale", "anchor", "kept", "zero_share"]
+
+
 def retained(daily: pd.DataFrame) -> pd.DataFrame:
-    """The daily series the models see: short days and the first day (no previous close) removed."""
-    return daily[~daily["short"] & daily["r_cc"].notna()].drop(columns="short")
+    """
+    The daily series the models see: short, stale and anchor days and the first day (no previous close) removed,
+    and the flag columns dropped.
+    """
+    return daily[daily["kept"]].drop(columns=FLAG_COLUMNS)
 
 
 def parkinson(high: pd.Series, low: pd.Series) -> pd.Series:
