@@ -382,3 +382,58 @@ def test_a_task_with_a_damaged_marker_is_run_again(stored, tmp_path, monkeypatch
     monkeypatch.setattr(S, "run_task", lambda *a: calls.append(a[1:3]) or {"seconds": 0})
     S.execute_tasks(tasks[:1], cfg_path, root / "clean", tmp_path, workers=1, progress=lambda m: None)
     assert calls == [tasks[0]]
+
+
+def test_a_marker_or_a_listed_file_that_cannot_be_read_means_the_task_is_not_finished(tmp_path):
+    """A marker that is a directory, or a listed file that is one, raises OSError when read; the task is then run again."""
+    S.task_marker(tmp_path, "primary", "AAA").mkdir()
+    assert S.task_done(tmp_path, "primary", "AAA") is None
+    (tmp_path / "primary__BBB__forecasts.parquet").mkdir()
+    S.task_marker(tmp_path, "primary", "BBB").write_text(json.dumps({"status": "ok", "files": {"primary__BBB__forecasts.parquet": "0" * 64}}))
+    assert S.task_done(tmp_path, "primary", "BBB") is None
+    assert S.task_done(tmp_path, "primary", "BBB", "any-key") is None
+
+
+def test_a_stopped_instrument_of_a_stamped_run_keeps_its_stamp_and_the_evaluation_accepts_it(stored, tmp_path, monkeypatch):
+    """PRESPEC 6 stops an instrument whose first HMM fit fails; its marker must carry the run key like every other, or stage 2 fails."""
+    root, cfg, cfg_path, tasks = stored
+    real = S.run_walk_forward
+
+    def stop_bbb(daily, models, wf, regime):
+        if np.isclose(daily["close"].iloc[0], make_daily(260, seed=2)["close"].iloc[0]) and np.isclose(daily["rv"].iloc[5], make_daily(260, seed=2)["rv"].iloc[5]):
+            raise HmmFirstFitError("first HMM fit failed at 2015-06-01: EM failed")
+        return real(daily, models, wf, regime)
+
+    monkeypatch.setattr(S, "run_walk_forward", stop_bbb)
+    mine, out = stamp_of(), tmp_path / "out"
+    quiet = dict(workers=1, progress=lambda m: None)
+    assert S.execute_tasks(tasks, cfg_path, root / "clean", out, stamp=mine, **quiet) == []
+    info = S.task_done(out, "primary", "BBB", mine["run_key"])
+    assert info["status"] == "stopped" and info["stamp"] == mine
+    two = S.replace(cfg, instruments=cfg.instruments[:2])                              # the two instruments that were run
+    summary = S.evaluate_all(two, out, tmp_path / "tables", tmp_path / "figures", progress=lambda m: None, run_key=mine["run_key"])
+    assert [s[:2] for s in summary] == [("primary", 1), ("harq", 1)]
+    assert list(pd.read_csv(tmp_path / "tables" / "primary__stopped_instruments.csv")["instrument"]) == ["BBB"]
+    real_task, calls = S.run_task, []
+    monkeypatch.setattr(S, "run_task", lambda *a: (calls.append(a[1:3]), real_task(*a))[1])
+    assert S.execute_tasks(tasks, cfg_path, root / "clean", out, stamp=mine, **quiet) == [] and calls == []   # the stopped ones are finished too
+
+
+def test_the_evaluation_uses_only_the_results_of_its_own_run(stored, tmp_path):
+    """evaluate_all(run_key): a stored result with another run's key is not used, even if it is intact and nothing else is wrong."""
+    root, cfg, cfg_path, tasks = stored
+    a, b = stamp_of(), stamp_of(commit="e" * 40)
+    out = tmp_path / "out"
+    out.mkdir()
+    for f in (root / "seq").iterdir():                                                  # the stored results, with the markers of run a
+        if f.name.endswith(".done.json"):
+            info = json.loads(f.read_text())
+            (out / f.name).write_text(json.dumps({**info, "stamp": a}))
+        else:
+            (out / f.name).write_bytes(f.read_bytes())
+    two = S.replace(cfg, instruments=cfg.instruments[:2])
+    with pytest.raises(FileNotFoundError, match="no complete result of this run"):
+        S.evaluate_all(two, out, tmp_path / "t_b", tmp_path / "f_b", progress=lambda m: None, run_key=b["run_key"])
+    assert not list((tmp_path / "t_b").glob("*")) and not list((tmp_path / "f_b").glob("*"))      # nothing was written from it
+    summary = S.evaluate_all(two, out, tmp_path / "t_a", tmp_path / "f_a", progress=lambda m: None, run_key=a["run_key"])
+    assert [s[:2] for s in summary] == [("primary", 2), ("harq", 2)] and (tmp_path / "t_a" / "primary__mean_loss.csv").exists()

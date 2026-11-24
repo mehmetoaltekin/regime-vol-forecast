@@ -331,6 +331,15 @@ def test_resume_refuses_a_lock_of_another_commit_configuration_or_prespec(tmp_pa
     (repo / "results" / "RUN_STARTED.lock").write_text('{"started": "2026-12-0')        # a lock cut short cannot be trusted either
     with pytest.raises(SystemExit, match="lock cannot be read"):
         R.run_full(cfg_path, resume=True)
+    for text in ("", "null", "[]", '"x"', "{}", '{"started": "yesterday", "bundle_hashes": {}}', '{"started": 5, "bundle_hashes": {}}',
+                 '{"started": "2026-12-01T00:00:00+00:00"}', '{"started": "2026-12-01T00:00:00+00:00", "bundle_hashes": []}'):
+        (repo / "results" / "RUN_STARTED.lock").write_text(text)                          # valid JSON, but not the lock of a run
+        with pytest.raises(SystemExit, match="lock cannot be read"):
+            R.run_full(cfg_path, resume=True)
+    (repo / "results" / "RUN_STARTED.lock").unlink()
+    (repo / "results" / "RUN_STARTED.lock").mkdir()                                       # a lock that cannot be read at all
+    with pytest.raises(SystemExit, match="lock cannot be read"):
+        R.run_full(cfg_path, resume=True)
 
 
 def test_resume_refuses_daily_rows_that_differ_from_those_of_the_started_run(tmp_path, monkeypatch):
@@ -348,6 +357,99 @@ def test_resume_refuses_daily_rows_that_differ_from_those_of_the_started_run(tmp
     monkeypatch.setattr(S, "prepare_all", lambda *a, **k: (rebuilt, []))
     with pytest.raises(SystemExit, match=rf"REFUSED: the daily rows daily__{symbols[1]}__main.parquet are not the ones"):
         R.run_full(cfg_path, workers=1, resume=True)
+
+
+def stage_spies(monkeypatch, repo, failures=()):
+    """The three stages of run_full replaced by spies that record what they are given, and the lock as it is while stage 1 runs."""
+    import json
+    seen = {"prepared": None, "written": []}
+    lock = repo / "results" / "RUN_STARTED.lock"
+
+    def prepare_all(cfg, config_path, clean_dir, raw_dir, workers=1, progress=print, only=None):
+        seen["prepared"] = list(only)
+        return {f"daily__{s}__main.parquet": f"{i:064x}" for i, s in enumerate(only)}, list(failures)
+
+    def execute_tasks(tasks, config_path, clean_dir, out_dir, workers=1, progress=print, stamp=None):
+        seen.update(tasks=tasks, stamp=stamp, lock=json.loads(lock.read_text()) if lock.exists() else None)
+        return []
+
+    def evaluate_all(cfg, out_dir, tables_dir, figures_dir, progress=print, clean_dir=None, run_key=None):
+        seen["run_key"] = run_key
+        return [("primary", 4, 1.0)]
+
+    real_atomic = S.write_atomic
+    monkeypatch.setattr(S, "prepare_all", prepare_all)
+    monkeypatch.setattr(S, "execute_tasks", execute_tasks)
+    monkeypatch.setattr(S, "evaluate_all", evaluate_all)
+    monkeypatch.setattr(S, "write_atomic", lambda path, w: (seen["written"].append(Path(path).name), real_atomic(path, w))[1])
+    monkeypatch.setattr(R, "verify_raw_hashes", lambda *a, **k: {"AAA_M1_syn.csv": "f" * 64})
+    return seen
+
+
+def test_run_full_hands_one_stamp_to_the_lock_the_tasks_and_the_evaluation(tmp_path, monkeypatch):
+    """The wiring after the guards (the slow rehearsal runs the real stages): one run key, in the lock, in every task and in stage 2."""
+    import json
+    from datetime import datetime
+    repo, cfg, cfg_path = approved_repo(tmp_path, monkeypatch)
+    seen = stage_spies(monkeypatch, repo)
+    R.run_full(cfg_path, workers=1, raw_dir=tmp_path)
+    commit, config_sha, prespec_sha = R.git_state()[0], R.sha256(cfg_path), R.sha256(repo / "PRESPEC.md")
+    symbols = sorted(s.symbol for s in cfg.instruments)
+    hashes = {f"daily__{s}__main.parquet": f"{i:064x}" for i, s in enumerate(symbols)}
+    stamp = S.run_stamp(commit, config_sha, prespec_sha, hashes)
+    assert seen["prepared"] == symbols and seen["stamp"] == stamp and seen["run_key"] == stamp["run_key"]
+    assert seen["tasks"] == [(v, s) for v in cfg.variants for s in S.variant_symbols(cfg, v)]
+    lock = seen["lock"]                                                                # as it was while the tasks ran
+    assert {k: lock[k] for k in ("commit", "config_sha256", "prespec_sha256", "bundle_hashes", "run_key")} == {
+        "commit": commit, "config_sha256": config_sha, "prespec_sha256": prespec_sha, "bundle_hashes": hashes, "run_key": stamp["run_key"]}
+    assert seen["written"] == ["RUN_STARTED.lock", "RUN_INFO.md"]                      # both go through write_atomic
+    info = (repo / "results" / "RUN_INFO.md").read_text()
+    started = datetime.fromisoformat(lock["started"])
+    assert stamp["run_key"] in info and commit in info and f"Run started (UTC): {started:%Y-%m-%d %H:%M:%S}" in info
+    assert "the run was resumed" not in info and not (repo / "results" / "RUN_STARTED.lock").exists()
+
+
+def test_a_resumed_run_keeps_its_start_time_and_takes_its_key_from_the_stored_rows(tmp_path, monkeypatch):
+    import json
+    repo, cfg, cfg_path = approved_repo(tmp_path, monkeypatch)
+    seen = stage_spies(monkeypatch, repo)
+    commit, config_sha, prespec_sha = R.git_state()[0], R.sha256(cfg_path), R.sha256(repo / "PRESPEC.md")
+    clean = repo / "data" / "clean"
+    clean.mkdir(parents=True)
+    stored = {}
+    for s in sorted(i.symbol for i in cfg.instruments):                                # the daily rows of the started run are all there
+        f = clean / f"daily__{s}__main.parquet"
+        f.write_bytes(s.encode())
+        stored[f.name] = R.sha256(f)
+    lock = {"started": "2026-01-02T03:04:05+00:00", "commit": commit, "config_sha256": config_sha, "prespec_sha256": prespec_sha,
+            "bundle_hashes": stored, "run_key": "not the key"}
+    (repo / "results" / "RUN_STARTED.lock").write_text(json.dumps(lock))
+    R.run_full(cfg_path, workers=1, resume=True, raw_dir=tmp_path)
+    stamp = S.run_stamp(commit, config_sha, prespec_sha, stored)
+    assert seen["prepared"] is None                                                    # nothing is rebuilt
+    assert seen["stamp"] == stamp and seen["run_key"] == stamp["run_key"]              # the key follows from the rows, not from the lock's text
+    assert seen["lock"] == lock and "RUN_STARTED.lock" not in seen["written"]          # the lock stays as it was, and is not written again
+    info = (repo / "results" / "RUN_INFO.md").read_text()
+    assert "Run started (UTC): 2026-01-02 03:04:05" in info and "the run was resumed" in info and stamp["run_key"] in info
+    assert not (repo / "results" / "RUN_STARTED.lock").exists()
+
+
+def test_a_stage_zero_failure_says_what_state_the_lock_is_in(tmp_path, monkeypatch):
+    repo, cfg, cfg_path = approved_repo(tmp_path, monkeypatch)
+    lock = repo / "results" / "RUN_STARTED.lock"
+    seen = stage_spies(monkeypatch, repo, failures=[(("cfg", "AAA", "dir", "raw"), "ValueError('no bars')")])
+    with pytest.raises(SystemExit, match=r"STOPPED in stage 0 \(no lock written, nothing to undo\): AAA: ValueError"):
+        R.run_full(cfg_path, workers=1, raw_dir=tmp_path)
+    assert not lock.exists() and seen["written"] == []
+    import json
+    commit, config_sha, prespec_sha = R.git_state()[0], R.sha256(cfg_path), R.sha256(repo / "PRESPEC.md")
+    stored = {f"daily__{s.symbol}__main.parquet": "a" * 64 for s in cfg.instruments}   # the files are gone: stage 0 rebuilds them
+    text = json.dumps({"started": "2026-01-02T03:04:05+00:00", "commit": commit, "config_sha256": config_sha, "prespec_sha256": prespec_sha,
+                       "bundle_hashes": stored, "run_key": "x"})
+    lock.write_text(text)
+    with pytest.raises(SystemExit, match=r"STOPPED in stage 0 \(the lock and the finished tasks are unchanged\): AAA: ValueError"):
+        R.run_full(cfg_path, workers=1, resume=True, raw_dir=tmp_path)
+    assert lock.read_text() == text
 
 
 def test_run_info_records_commit_versions_and_hashes(tmp_path, monkeypatch):

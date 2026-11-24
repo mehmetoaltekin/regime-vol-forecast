@@ -169,6 +169,18 @@ def default_workers(n_tasks: int) -> int:
     return max(1, min((os.cpu_count() or 2) - 2, n_tasks))
 
 
+def read_lock(lock: Path) -> dict:
+    """The contents of RUN_STARTED.lock; a lock that is not the JSON object of a started run (cut short, empty, a list ...) is refused."""
+    try:
+        prior = json.loads(lock.read_text())
+        datetime.fromisoformat(prior["started"])
+        if not isinstance(prior["bundle_hashes"], dict):
+            raise TypeError("bundle_hashes is not an object")
+        return prior
+    except (ValueError, KeyError, TypeError, OSError):
+        raise SystemExit("REFUSED: results/RUN_STARTED.lock cannot be read")
+
+
 def run_full(config_path: Path, workers: int | None = None, resume: bool = False, raw_dir: Path = RAW,
              hash_table: Path | None = None) -> None:
     cfg = S.StudyConfig.from_json(config_path)
@@ -195,10 +207,7 @@ def run_full(config_path: Path, workers: int | None = None, resume: bool = False
     config_sha, prespec_sha = sha256(config_path), sha256(ROOT / "PRESPEC.md")
     prior = {}
     if resume:
-        try:
-            prior = json.loads(lock.read_text())
-        except ValueError:
-            raise SystemExit("REFUSED: results/RUN_STARTED.lock cannot be read")
+        prior = read_lock(lock)
         for key, now, label in (("commit", commit, "commit"), ("config_sha256", config_sha, "configuration"),
                                 ("prespec_sha256", prespec_sha, "PRESPEC.md")):
             if prior.get(key) != now:
@@ -218,7 +227,8 @@ def run_full(config_path: Path, workers: int | None = None, resume: bool = False
     log(f"stage 0: daily rows of {', '.join(todo) if todo else 'no instrument (all present)'}")
     new_hashes, failures = S.prepare_all(cfg, config_path, clean_dir, raw_dir, workers, log, only=todo) if todo else ({}, [])
     if failures:
-        raise SystemExit("STOPPED in stage 0 (no lock written, nothing to undo): " + "; ".join(f"{j[1]}: {e}" for j, e in failures))
+        state = "the lock and the finished tasks are unchanged" if resume else "no lock written, nothing to undo"
+        raise SystemExit(f"STOPPED in stage 0 ({state}): " + "; ".join(f"{j[1]}: {e}" for j, e in failures))
     changed = sorted(n for n, h in new_hashes.items() if n in stored and stored[n] != h)
     if changed:                                             # the finished tasks were made from other daily rows
         raise SystemExit(f"REFUSED: the daily rows {', '.join(changed)} are not the ones the run was started with; the finished "
