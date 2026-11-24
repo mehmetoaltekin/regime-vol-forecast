@@ -195,11 +195,11 @@ def test_an_interrupted_run_continues_with_the_unfinished_tasks_only(stored, tmp
     root, cfg, cfg_path, tasks = stored
     real, calls = S.run_task, []
 
-    def flaky(config_path, variant, symbol, clean_dir, out_dir):
+    def flaky(config_path, variant, symbol, clean_dir, out_dir, *stamp):
         calls.append((variant, symbol))
         if (variant, symbol) == ("harq", "AAA"):
             raise MemoryError("the machine ran out of memory")
-        return real(config_path, variant, symbol, clean_dir, out_dir)
+        return real(config_path, variant, symbol, clean_dir, out_dir, *stamp)
 
     monkeypatch.setattr(S, "run_task", flaky)
     failures = S.execute_tasks(tasks, cfg_path, root / "clean", tmp_path / "run", workers=1, progress=lambda m: None)
@@ -309,3 +309,76 @@ def test_descriptive_tables_and_the_log_rv_correlation_matrix():
     sample = out["correlation_log_rv_sample"].iloc[0]
     assert sample["common_days"] == len(common) == 258                                   # 2 February (day 22) to day 279 of the others
     assert sample["first"] == common.index[0] and sample["last"] == common.index[-1]
+
+
+# ------------------------------------------------------------------------------------------ results belong to one run
+
+def stamp_of(commit="a" * 40, config="b" * 64, prespec="c" * 64, bundles=None):
+    return S.run_stamp(commit, config, prespec, bundles or {"daily__AAA__main.parquet": "d" * 64})
+
+
+def test_the_run_key_changes_with_every_part_of_the_run():
+    """A stored task belongs to one commit, configuration, PRESPEC.md and set of daily rows: changing any of them changes the key."""
+    base = stamp_of()
+    assert len(base["run_key"]) == 64 and base["run_key"] == stamp_of()["run_key"]
+    assert {k: base[k] for k in ("commit", "config_sha256", "prespec_sha256")} == {"commit": "a" * 40, "config_sha256": "b" * 64,
+                                                                                    "prespec_sha256": "c" * 64}
+    different = (stamp_of(commit="e" * 40), stamp_of(config="e" * 64), stamp_of(prespec="e" * 64),
+                 stamp_of(bundles={"daily__AAA__main.parquet": "e" * 64}),
+                 stamp_of(bundles={"daily__AAA__main.parquet": "d" * 64, "daily__BBB__main.parquet": "d" * 64}))
+    assert len({base["run_key"], *(s["run_key"] for s in different)}) == 6
+    assert stamp_of(bundles={"b": "1", "a": "2"})["run_key"] == stamp_of(bundles={"a": "2", "b": "1"})["run_key"]   # the order does not matter
+
+
+def test_a_task_result_belongs_to_the_run_that_made_it(stored, tmp_path):
+    """PRESPEC 11: a result is used only by the run that made it; a stored result of other code is not 'finished'."""
+    root, cfg, cfg_path, tasks = stored
+    mine, other = stamp_of(), stamp_of(commit="e" * 40)
+    S.run_task(str(cfg_path), "harq", "AAA", str(root / "clean"), str(tmp_path), mine)
+    info = S.task_done(tmp_path, "harq", "AAA", mine["run_key"])
+    assert info["status"] == "ok" and info["stamp"] == mine
+    assert S.task_done(tmp_path, "harq", "AAA", other["run_key"]) is None              # made by another run
+    assert S.task_done(tmp_path, "harq", "AAA") is not None                            # without a key every intact task counts
+    with pytest.raises(FileNotFoundError, match="no complete result of this run"):
+        S.load_variant_results(tmp_path, "harq", ["AAA"], other["run_key"])
+    res, stopped = S.load_variant_results(tmp_path, "harq", ["AAA"], mine["run_key"])
+    assert set(res) == {"AAA"} and stopped == {}
+
+
+def test_a_stopped_instrument_carries_the_stamp_too(tmp_path):
+    mine = stamp_of()
+    S.save_stopped(tmp_path, "primary", "AAA", "first HMM fit failed", 1.0, mine)
+    assert S.task_done(tmp_path, "primary", "AAA", mine["run_key"])["stamp"] == mine
+    assert S.task_done(tmp_path, "primary", "AAA", stamp_of(config="e" * 64)["run_key"]) is None
+
+
+def test_execute_tasks_computes_again_what_another_run_left_behind(stored, tmp_path, monkeypatch):
+    """The failure that OP-1 describes: new code must not reuse forecasts that older code made into the same folder."""
+    root, cfg, cfg_path, tasks = stored
+    old, new = stamp_of(), stamp_of(commit="e" * 40)
+    quiet = dict(workers=1, progress=lambda m: None)
+    assert S.execute_tasks(tasks[:1], cfg_path, root / "clean", tmp_path, stamp=old, **quiet) == []
+    real, calls = S.run_task, []
+    monkeypatch.setattr(S, "run_task", lambda *a: (calls.append(a[1:3]), real(*a))[1])
+    assert S.execute_tasks(tasks[:1], cfg_path, root / "clean", tmp_path, stamp=old, **quiet) == [] and calls == []   # the same run: nothing to do
+    assert S.execute_tasks(tasks[:1], cfg_path, root / "clean", tmp_path, stamp=new, **quiet) == []
+    assert calls == [tasks[0]]                                                          # another run: computed again
+    assert S.task_done(tmp_path, *tasks[0], new["run_key"])["stamp"] == new
+
+
+@pytest.mark.parametrize("content", ["", "{", "[]", "null", '"text"', "{}", '{"status": "ok"}', '{"status": "ok", "files": []}',
+                                     '{"status": "ok", "files": {"x__y__forecasts.parquet": "0"}}'])
+def test_a_damaged_marker_means_the_task_is_not_finished(tmp_path, content):
+    """A power cut can leave an empty or half-written marker; the task is then run again instead of the run crashing."""
+    S.task_marker(tmp_path, "primary", "AAA").write_text(content)
+    assert S.task_done(tmp_path, "primary", "AAA") is None
+    assert S.task_done(tmp_path, "primary", "AAA", "any-key") is None
+
+
+def test_a_task_with_a_damaged_marker_is_run_again(stored, tmp_path, monkeypatch):
+    root, cfg, cfg_path, tasks = stored
+    S.task_marker(tmp_path, *tasks[0]).write_text("")
+    calls = []
+    monkeypatch.setattr(S, "run_task", lambda *a: calls.append(a[1:3]) or {"seconds": 0})
+    S.execute_tasks(tasks[:1], cfg_path, root / "clean", tmp_path, workers=1, progress=lambda m: None)
+    assert calls == [tasks[0]]

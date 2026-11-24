@@ -11,16 +11,19 @@ The full run refuses to start unless
     current one,
   - the working tree has no uncommitted change in tracked files (the commit hash goes into results/RUN_INFO.md),
   - the SHA-256 of every raw data file equals the one stored in results/raw_data_sha256.tsv,
-  - neither results/RUN_INFO.md nor results/RUN_STARTED.lock exists: the run happens once.
+  - neither results/RUN_INFO.md nor results/RUN_STARTED.lock exists: the run happens once,
+  - results/forecasts, results/tables and results/figures are empty (no result of earlier code can be mixed in).
 
 The run has three stages. Stage 0 prepares the daily rows of every instrument (data/clean/); a data problem stops the
 run here, before the lock is written. Stage 1 runs one walk-forward task per (variant, instrument) in worker processes;
-every finished task is stored with a completion marker. Stage 2 evaluates the stored results and writes tables,
-figures and RUN_INFO.md. The result does not depend on the number of workers.
+every finished task is stored with a completion marker that carries the run key (a hash of the commit, the configuration,
+PRESPEC.md and the daily rows). Stage 2 evaluates the stored results of this run and writes tables, figures and
+RUN_INFO.md. The result does not depend on the number of workers.
 
 If the run is interrupted (machine asleep, process killed), `--resume` continues it: it needs the lock, the same commit,
-the same configuration and the same PRESPEC.md, and it skips finished tasks. If the code has to change, the finished
-tasks are void: start again from an empty results/forecasts/ and no lock.
+the same configuration, the same PRESPEC.md and the same daily rows, and it skips the tasks that are finished and carry the
+run key. If the code has to change, the finished tasks are void: move results/forecasts, results/tables and results/figures
+away, delete the lock and start again.
 Development mode writes to results/dev/ only, never touches data after the first training window and writes
 no RUN_INFO.md.
 """
@@ -155,6 +158,11 @@ def make_logger(path: Path):
     return log
 
 
+def leftovers(*dirs: Path) -> list[Path]:
+    """The files that an earlier run left in these folders (hidden files such as .gitkeep do not count)."""
+    return sorted(p for d in dirs if d.exists() for p in d.rglob("*") if p.is_file() and not p.name.startswith("."))
+
+
 def default_workers(n_tasks: int) -> int:
     return max(1, min((os.cpu_count() or 2) - 2, n_tasks))
 
@@ -165,11 +173,18 @@ def run_full(config_path: Path, workers: int | None = None, resume: bool = False
     version = check_prespec(ROOT / "PRESPEC.md", cfg.prespec_version, MINIMUM_VERSION)
     check_tag()
     lock, info = RESULTS / "RUN_STARTED.lock", RESULTS / "RUN_INFO.md"
+    clean_dir, out_dir = ROOT / "data" / "clean", RESULTS / "forecasts"
     if info.exists() or (lock.exists() and not resume):
         raise SystemExit("REFUSED: the full run has been started before (results/RUN_INFO.md or RUN_STARTED.lock exists; "
                          "--resume continues an interrupted run)")
     if resume and not lock.exists():
         raise SystemExit("REFUSED: nothing to resume (no results/RUN_STARTED.lock)")
+    if not resume:                                          # results of earlier code must never be mixed into this run
+        old = leftovers(out_dir, RESULTS / "tables", RESULTS / "figures")
+        if old:
+            shown = ", ".join(f"{p.parent.name}/{p.name}" for p in old[:3]) + (f" and {len(old) - 3} more" if len(old) > 3 else "")
+            raise SystemExit(f"REFUSED: earlier results are in the way ({shown}). A new run starts from empty results/forecasts, "
+                             "results/tables and results/figures; move them away first")
     commit, dirty = git_state()
     if dirty:
         raise SystemExit("REFUSED: uncommitted changes in tracked files:\n  " + "\n  ".join(dirty))
@@ -188,7 +203,6 @@ def run_full(config_path: Path, workers: int | None = None, resume: bool = False
                 raise SystemExit(f"REFUSED: the {label} is not the one the run was started with; a changed code base voids "
                                  "the finished tasks, so start again from an empty results/forecasts/ and no lock")
     log = make_logger(RESULTS / "run_progress.log")
-    clean_dir, out_dir = ROOT / "data" / "clean", RESULTS / "forecasts"
     tasks = [(v, s) for v in cfg.variants for s in S.variant_symbols(cfg, v)]
     workers = workers if workers is not None else default_workers(len(tasks))
     started = datetime.fromisoformat(prior["started"]) if prior else datetime.now(timezone.utc)
@@ -203,23 +217,29 @@ def run_full(config_path: Path, workers: int | None = None, resume: bool = False
     new_hashes, failures = S.prepare_all(cfg, config_path, clean_dir, raw_dir, workers, log, only=todo) if todo else ({}, [])
     if failures:
         raise SystemExit("STOPPED in stage 0 (no lock written, nothing to undo): " + "; ".join(f"{j[1]}: {e}" for j, e in failures))
+    changed = sorted(n for n, h in new_hashes.items() if n in stored and stored[n] != h)
+    if changed:                                             # the finished tasks were made from other daily rows
+        raise SystemExit(f"REFUSED: the daily rows {', '.join(changed)} are not the ones the run was started with; the finished "
+                         "tasks are void, so start again from empty results folders and no lock")
     bundle_hashes = {**stored, **new_hashes}
+    stamp = S.run_stamp(commit, config_sha, prespec_sha, bundle_hashes)
     if not resume:
-        lock.write_text(json.dumps({"started": started.isoformat(), "commit": commit, "config_sha256": config_sha,
-                                    "prespec_sha256": prespec_sha, "bundle_hashes": bundle_hashes}, indent=1))
+        S.write_atomic(lock, lambda p: p.write_text(json.dumps(
+            {"started": started.isoformat(), "commit": commit, "config_sha256": config_sha, "prespec_sha256": prespec_sha,
+             "bundle_hashes": bundle_hashes, "run_key": stamp["run_key"]}, indent=1)))
 
     # stage 1: one walk-forward task per (variant, instrument)
     log(f"stage 1: {len(tasks)} tasks, {workers} worker(s)")
-    failures = S.execute_tasks(tasks, config_path, clean_dir, out_dir, workers, log)
+    failures = S.execute_tasks(tasks, config_path, clean_dir, out_dir, workers, log, stamp=stamp)
     if failures:
         raise SystemExit(f"STOPPED: {len(failures)} task(s) failed ({'; '.join(f'{j[1]}/{j[2]}: {e}' for j, e in failures[:5])}). "
                          "If the cause is outside the code (machine, memory), run again with --resume; the lock stays.")
 
     # stage 2: evaluation of the stored results
     log("stage 2: evaluation")
-    summary = S.evaluate_all(cfg, out_dir, RESULTS / "tables", RESULTS / "figures", log, clean_dir=clean_dir)
+    summary = S.evaluate_all(cfg, out_dir, RESULTS / "tables", RESULTS / "figures", log, clean_dir=clean_dir, run_key=stamp["run_key"])
     write_run_info(cfg, version, commit, hashes, started, time.time() - t0, summary, config_path,
-                   extra={"workers": workers, "bundle_hashes": bundle_hashes, "resumed": resume})
+                   extra={"workers": workers, "bundle_hashes": bundle_hashes, "resumed": resume, "run_key": stamp["run_key"]})
     log("finished")
 
 
@@ -232,6 +252,8 @@ def write_run_info(cfg, version, commit, hashes, started, seconds, summary, conf
              + (f" ({extra['workers']} worker(s); the run was resumed)" if extra.get("resumed") else
                 f" ({extra['workers']} worker(s))" if "workers" in extra else ""),
              f"- Git commit of the frozen code: `{commit}`",
+             *([f"- Run key (commit, configuration, PRESPEC.md and daily rows; every stored task result carries it): `{extra['run_key']}`"]
+               if "run_key" in extra else []),
              f"- PRESPEC version: {version}",
              f"- Configuration file: `{config_path.name}` (SHA-256 {sha256(config_path)})",
              f"- Python {platform.python_version()} on {platform.platform()}", "",
@@ -241,7 +263,7 @@ def write_run_info(cfg, version, commit, hashes, started, seconds, summary, conf
                if "bundle_hashes" in extra else []),
              "## Variants run", "", *[f"- {n}: {k} instruments, task time {s:.0f} s" for n, k, s in summary], "",
              "## Configuration", "", "```json", cfg.to_json(), "```", ""]
-    (RESULTS / "RUN_INFO.md").write_text("\n".join(lines))
+    S.write_atomic(RESULTS / "RUN_INFO.md", lambda p: p.write_text("\n".join(lines)))      # whole or not at all
     (RESULTS / "RUN_STARTED.lock").unlink(missing_ok=True)
     print("wrote results/RUN_INFO.md")
 

@@ -261,6 +261,64 @@ def test_full_run_refuses_without_tag_dirty_tree_second_run_and_draft(tmp_path, 
     assert not (repo / "results" / "RUN_STARTED.lock").exists()                      # a refused run leaves nothing behind
 
 
+def approved_repo(tmp_path, monkeypatch):
+    """A git repo with an approved PRESPEC.md (version 1.0) carrying the tag prespec-v1.0, a configuration and the run_study paths."""
+    repo = tmp_path / "repo"
+    (repo / "results").mkdir(parents=True)
+    run = lambda *a: subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True)
+    run("init", "-q")
+    run("config", "user.email", "t@example.com")
+    run("config", "user.name", "t")
+    write_prespec(repo / "PRESPEC.md", "1.0", "Approved")
+    run("add", "PRESPEC.md")
+    run("commit", "-q", "-m", "x")
+    run("tag", "prespec-v1.0")
+    cfg = small_cfg(prespec_version="1.0")
+    cfg_path = repo / "cfg.json"
+    cfg_path.write_text(cfg.to_json())
+    monkeypatch.setattr(R, "ROOT", repo)
+    monkeypatch.setattr(R, "RESULTS", repo / "results")
+    return repo, cfg, cfg_path
+
+
+def test_a_new_run_refuses_to_start_on_results_of_earlier_code(tmp_path, monkeypatch):
+    """OP-1: with no lock, results left in forecasts, tables or figures could be mixed into the new run, so it does not start."""
+    repo, cfg, cfg_path = approved_repo(tmp_path, monkeypatch)
+    for folder, name in (("forecasts", "primary__AAA.done.json"), ("tables", "primary__mean_loss.csv"), ("figures", "primary__prob_stress.pdf")):
+        (repo / "results" / folder).mkdir()
+        (repo / "results" / folder / ".gitkeep").write_text("")                          # a hidden placeholder does not count
+        assert R.leftovers(repo / "results" / folder) == []
+        (repo / "results" / folder / name).write_text("x")
+        with pytest.raises(SystemExit, match=rf"earlier results are in the way \({folder}/{name}\)"):
+            R.run_full(cfg_path)
+        (repo / "results" / folder / name).unlink()
+    (repo / "results" / "forecasts" / "sub").mkdir()
+    for i in range(5):
+        (repo / "results" / "forecasts" / "sub" / f"f{i}.parquet").write_text("x")
+    with pytest.raises(SystemExit, match=r"earlier results are in the way \(sub/f0.parquet, sub/f1.parquet, sub/f2.parquet and 2 more\)"):
+        R.run_full(cfg_path)
+    assert not (repo / "results" / "RUN_STARTED.lock").exists()                        # a refused run leaves no lock behind
+    with pytest.raises(SystemExit, match="nothing to resume"):                         # resuming needs a lock, whatever lies around
+        R.run_full(cfg_path, resume=True)
+
+
+def test_resume_refuses_daily_rows_that_differ_from_those_of_the_started_run(tmp_path, monkeypatch):
+    """The finished tasks were computed from the daily rows named in the lock; other rows void them."""
+    import json
+    repo, cfg, cfg_path = approved_repo(tmp_path, monkeypatch)
+    commit = R.git_state()[0]
+    symbols = sorted(s.symbol for s in cfg.instruments)
+    stored = {f"daily__{s}__main.parquet": "a" * 64 for s in symbols}
+    (repo / "results" / "RUN_STARTED.lock").write_text(json.dumps({
+        "started": "2026-12-01T00:00:00+00:00", "commit": commit, "config_sha256": R.sha256(cfg_path),
+        "prespec_sha256": R.sha256(repo / "PRESPEC.md"), "bundle_hashes": stored, "run_key": "x"}))
+    monkeypatch.setattr(R, "verify_raw_hashes", lambda *a, **k: {})
+    rebuilt = dict(stored, **{f"daily__{symbols[1]}__main.parquet": "b" * 64})
+    monkeypatch.setattr(S, "prepare_all", lambda *a, **k: (rebuilt, []))
+    with pytest.raises(SystemExit, match=rf"REFUSED: the daily rows daily__{symbols[1]}__main.parquet are not the ones"):
+        R.run_full(cfg_path, workers=1, resume=True)
+
+
 def test_run_info_records_commit_versions_and_hashes(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "RESULTS", tmp_path)
     (tmp_path / "RUN_STARTED.lock").write_text("x")
@@ -274,6 +332,33 @@ def test_run_info_records_commit_versions_and_hashes(tmp_path, monkeypatch):
     assert "a" * 40 in text and "hmm-regime 0.2.0" in text and "f" * 64 in text and "PRESPEC version: 0.3" in text
     assert "2026-12-01" in text and "primary: 2 instruments" in text and '"window": 120' in text
     assert not (tmp_path / "RUN_STARTED.lock").exists()                              # the lock goes only after a complete run
+
+
+def test_run_info_is_written_through_write_atomic_and_a_failed_write_leaves_nothing(tmp_path, monkeypatch):
+    """A kill while RUN_INFO.md is being written must not leave a truncated file that blocks every later start."""
+    f = tmp_path / "x.txt"
+    f.write_text("old")
+
+    def broken(p):
+        p.write_text("par")
+        raise OSError("disk full")
+
+    with pytest.raises(OSError):
+        S.write_atomic(f, broken)
+    assert f.read_text() == "old"                                                    # the old file is untouched
+    g = tmp_path / "new.txt"
+    with pytest.raises(OSError):
+        S.write_atomic(g, broken)
+    assert not g.exists()                                                            # and a new file does not appear half written
+    monkeypatch.setattr(R, "RESULTS", tmp_path)
+    seen, real = [], S.write_atomic
+    monkeypatch.setattr(S, "write_atomic", lambda path, w: (seen.append(Path(path).name), real(path, w))[1])
+    cfg = small_cfg(prespec_version="1.0")
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(cfg.to_json())
+    from datetime import datetime, timezone
+    R.write_run_info(cfg, "1.0", "a" * 40, {}, datetime(2026, 12, 1, tzinfo=timezone.utc), 1.0, [], cfg_path, extra={"run_key": "k" * 64})
+    assert seen == ["RUN_INFO.md"] and "k" * 64 in (tmp_path / "RUN_INFO.md").read_text()
 
 
 def test_development_mode_writes_only_below_results_dev():

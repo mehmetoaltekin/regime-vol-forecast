@@ -334,43 +334,63 @@ def prepare_instrument(config_path: str, symbol: str, clean_dir: str, raw_dir: s
     return out
 
 
+def run_stamp(commit: str, config_sha256: str, prespec_sha256: str, bundle_hashes: dict[str, str]) -> dict:
+    """
+    What a stored task result must carry to belong to one run: the code (commit), the configuration, PRESPEC.md and the daily
+    rows it was computed from. `run_key` is a hash of all four; the other fields are there for a reader of the marker.
+    """
+    parts = {"commit": commit, "config_sha256": config_sha256, "prespec_sha256": prespec_sha256,
+             "bundle_hashes": dict(sorted(bundle_hashes.items()))}
+    key = hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
+    return {"run_key": key, "commit": commit, "config_sha256": config_sha256, "prespec_sha256": prespec_sha256}
+
+
 def task_marker(out_dir: Path, variant: str, symbol: str) -> Path:
     return Path(out_dir) / f"{variant}__{symbol}.done.json"
 
 
-def task_done(out_dir: Path, variant: str, symbol: str) -> dict | None:
-    """The completion marker of a task if the task finished and its files are intact, else None."""
+def task_done(out_dir: Path, variant: str, symbol: str, run_key: str | None = None) -> dict | None:
+    """
+    The completion marker of a task if the task finished, its files are intact and (with `run_key`) it was made by that
+    run; else None. An empty or damaged marker, such as a power cut can leave, means the task is not finished.
+    """
     m = task_marker(out_dir, variant, symbol)
     if not m.exists():
         return None
-    info = json.loads(m.read_text())
-    if info["status"] == "ok":
-        for name, digest in info["files"].items():
-            f = Path(out_dir) / name
-            if not f.exists() or sha256_file(f) != digest:
-                return None
+    try:
+        info = json.loads(m.read_text())
+        if info["status"] == "ok":
+            for name, digest in info["files"].items():
+                f = Path(out_dir) / name
+                if not f.exists() or sha256_file(f) != digest:
+                    return None
+        if run_key is not None and info.get("stamp", {}).get("run_key") != run_key:
+            return None
+    except (ValueError, KeyError, TypeError, AttributeError, OSError):
+        return None
     return info
 
 
-def save_task(res: WFResult, out_dir: Path, variant: str, symbol: str, seconds: float) -> dict:
+def save_task(res: WFResult, out_dir: Path, variant: str, symbol: str, seconds: float, stamp: dict | None = None) -> dict:
     out_dir = Path(out_dir)
     files = {}
     for name, df in (("forecasts", res.forecasts.reset_index()), ("regime", res.regime.reset_index()), ("counters", res.counters)):
         p = out_dir / f"{variant}__{symbol}__{name}.parquet"
         write_atomic(p, lambda q, d=df: d.to_parquet(q, index=False))
         files[p.name] = sha256_file(p)
-    info = {"variant": variant, "symbol": symbol, "status": "ok", "files": files, "seconds": round(seconds, 1)}
+    info = {"variant": variant, "symbol": symbol, "status": "ok", "files": files, "seconds": round(seconds, 1), "stamp": stamp or {}}
     write_atomic(task_marker(out_dir, variant, symbol), lambda q: q.write_text(json.dumps(info, indent=1)))
     return info
 
 
-def save_stopped(out_dir: Path, variant: str, symbol: str, reason: str, seconds: float) -> dict:
-    info = {"variant": variant, "symbol": symbol, "status": "stopped", "reason": reason, "seconds": round(seconds, 1)}
+def save_stopped(out_dir: Path, variant: str, symbol: str, reason: str, seconds: float, stamp: dict | None = None) -> dict:
+    info = {"variant": variant, "symbol": symbol, "status": "stopped", "reason": reason, "seconds": round(seconds, 1),
+            "stamp": stamp or {}}
     write_atomic(task_marker(Path(out_dir), variant, symbol), lambda q: q.write_text(json.dumps(info, indent=1)))
     return info
 
 
-def run_task(config_path: str, variant: str, symbol: str, clean_dir: str, out_dir: str) -> dict:
+def run_task(config_path: str, variant: str, symbol: str, clean_dir: str, out_dir: str, stamp: dict | None = None) -> dict:
     """One walk-forward run (one variant, one instrument), written to disk. Top-level so that a worker can import it."""
     cfg = StudyConfig.from_json(Path(config_path))
     daily = variant_daily(pd.read_parquet(bundle_file(Path(clean_dir), symbol, sample_of(variant))), variant)
@@ -380,8 +400,8 @@ def run_task(config_path: str, variant: str, symbol: str, clean_dir: str, out_di
         with single_thread():
             res = run_walk_forward(daily, setup["factory"](), setup["wf"], setup["regime"])
     except HmmFirstFitError as e:                          # PRESPEC 6: the instrument is stopped and reported
-        return save_stopped(Path(out_dir), variant, symbol, str(e), time.time() - t0)
-    return save_task(res, Path(out_dir), variant, symbol, time.time() - t0)
+        return save_stopped(Path(out_dir), variant, symbol, str(e), time.time() - t0, stamp)
+    return save_task(res, Path(out_dir), variant, symbol, time.time() - t0, stamp)
 
 
 def _pool(workers: int, fn: Callable, jobs: list[tuple], progress: Callable[[str], None], describe: Callable
@@ -432,20 +452,25 @@ def prepare_all(cfg: StudyConfig, config_path: Path, clean_dir: Path, raw_dir: P
 
 
 def execute_tasks(tasks: list[tuple[str, str]], config_path: Path, clean_dir: Path, out_dir: Path, workers: int = 1,
-                  progress: Callable[[str], None] = print) -> list[tuple]:
-    """Run the tasks that are not finished yet; returns the failures. Tasks already finished are skipped (resume)."""
-    todo = [(str(config_path), v, s, str(clean_dir), str(out_dir)) for v, s in tasks if task_done(out_dir, v, s) is None]
+                  progress: Callable[[str], None] = print, stamp: dict | None = None) -> list[tuple]:
+    """
+    Run the tasks that are not finished yet; returns the failures. Tasks already finished are skipped (resume). With a
+    `stamp` (see run_stamp) a finished task counts only if it carries the same run key, and every task that runs gets the stamp.
+    """
+    run_key = stamp["run_key"] if stamp else None
+    todo = [(str(config_path), v, s, str(clean_dir), str(out_dir), stamp) for v, s in tasks if task_done(out_dir, v, s, run_key) is None]
     progress(f"{len(tasks) - len(todo)} of {len(tasks)} tasks are already finished; {len(todo)} to run, {max(workers, 1)} worker(s)")
     return _pool(workers, run_task, todo, progress, lambda job: f"task {job[1]} / {job[2]}")[1]
 
 
-def load_variant_results(out_dir: Path, variant: str, symbols: list[str]) -> tuple[dict[str, WFResult], dict[str, str]]:
+def load_variant_results(out_dir: Path, variant: str, symbols: list[str], run_key: str | None = None
+                         ) -> tuple[dict[str, WFResult], dict[str, str]]:
     """The stored results of a variant: (results of the instruments that ran, reasons of those that were stopped)."""
     results, stopped = {}, {}
     for s in symbols:
-        info = task_done(out_dir, variant, s)
+        info = task_done(out_dir, variant, s, run_key)
         if info is None:
-            raise FileNotFoundError(f"task {variant} / {s} has no complete result in {out_dir}")
+            raise FileNotFoundError(f"task {variant} / {s} has no complete result{' of this run' if run_key else ''} in {out_dir}")
         if info["status"] == "stopped":
             stopped[s] = info["reason"]
             continue
@@ -675,11 +700,13 @@ def descriptive_tables(bundles: dict[str, pd.DataFrame]) -> dict[str, pd.DataFra
 
 
 def evaluate_all(cfg: StudyConfig, out_dir: Path, tables_dir: Path, figures_dir: Path,
-                 progress: Callable[[str], None] = print, clean_dir: Path | None = None) -> list[tuple[str, int, float]]:
+                 progress: Callable[[str], None] = print, clean_dir: Path | None = None,
+                 run_key: str | None = None) -> list[tuple[str, int, float]]:
     """
     Evaluate every variant from its stored task results: tables (CSV and LaTeX), figures, the instruments that were
     stopped, and for the primary run the MSE-loss tables of robustness check 7. With clean_dir (the daily rows of stage 0)
-    also the descriptive statistics and the log-RV correlation matrix of the panel. Returns (variant, instruments, seconds).
+    also the descriptive statistics and the log-RV correlation matrix of the panel. With run_key only results that carry
+    that run key are used. Returns (variant, instruments, seconds).
     """
     summary = []
     if clean_dir is not None:
@@ -687,12 +714,12 @@ def evaluate_all(cfg: StudyConfig, out_dir: Path, tables_dir: Path, figures_dir:
         write_tables(descriptive_tables(bundles), tables_dir, "data")
         progress("wrote the descriptive statistics and the log-RV correlation matrix")
     for name in cfg.variants:
-        results, stopped = load_variant_results(out_dir, name, variant_symbols(cfg, name))
+        results, stopped = load_variant_results(out_dir, name, variant_symbols(cfg, name), run_key)
         if stopped:                                          # PRESPEC 6: first HMM fit failed, instrument stopped
             Path(tables_dir).mkdir(parents=True, exist_ok=True)
             pd.DataFrame({"instrument": list(stopped), "reason": list(stopped.values())}).to_csv(
                 Path(tables_dir) / f"{name}__stopped_instruments.csv", index=False)
-        task_seconds = sum(task_done(out_dir, name, s)["seconds"] for s in variant_symbols(cfg, name))
+        task_seconds = sum(task_done(out_dir, name, s, run_key)["seconds"] for s in variant_symbols(cfg, name))
         if results:
             setup = variant_setup(name, cfg)
             write_tables(evaluate_run(results, cfg, families=setup["families"]), tables_dir, name)

@@ -3,6 +3,7 @@ Dress rehearsal of the full run on synthetic data: every variant, every stage, w
 resume. Slow (minutes), so it is not part of the default run: `uv run pytest -m slow`.
 """
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -86,11 +87,13 @@ def test_every_variant_runs_through_all_three_stages_with_worker_processes(tmp_p
     assert commit in info and "hmm-regime 0.2.0" in info and "3 worker(s)" in info and "daily__AAA__long.parquet" in info
     for sym, _, _ in SYMBOLS:
         assert f"{sym}_M1_20230102_20231229.csv" in info
+    run_key = re.search(r"Run key.*`([0-9a-f]{64})`", info).group(1)                       # every stored task carries it
     for v in S.VARIANTS:
         symbols = S.variant_symbols(cfg, v)
         assert symbols == (["AAA", "BBB", "CCC"] if v == "long_history" else ["AAA", "BBB", "CCC", "DDD"])
         for s in symbols:
-            assert S.task_done(res / "forecasts", v, s)["status"] == "ok", (v, s)
+            assert S.task_done(res / "forecasts", v, s, run_key)["status"] == "ok", (v, s)
+            assert S.task_done(res / "forecasts", v, s, run_key)["stamp"]["commit"] == commit
         mean_loss = pd.read_csv(res / "tables" / f"{v}__mean_loss.csv")
         assert set(mean_loss["instrument"]) == set(symbols), v
         assert (res / "figures" / f"{v}__prob_stress.pdf").exists() and (res / "figures" / f"{v}__cum_qlike_diff.pdf").exists()
@@ -143,19 +146,24 @@ def test_an_interrupted_run_is_resumed_and_gives_the_same_results(tmp_path, monk
     attach(monkeypatch, repo2)
     real = S.run_task
 
-    def interrupted(config_path, variant, symbol, clean_dir, out_dir):
+    def interrupted(config_path, variant, symbol, clean_dir, out_dir, *stamp):
         if (variant, symbol) == ("harq", "BBB"):
             raise MemoryError("killed")
-        return real(config_path, variant, symbol, clean_dir, out_dir)
+        return real(config_path, variant, symbol, clean_dir, out_dir, *stamp)
 
     monkeypatch.setattr(S, "run_task", interrupted)
+    atomic, real_atomic = [], S.write_atomic
+    monkeypatch.setattr(S, "write_atomic", lambda path, w: (atomic.append(Path(path).name), real_atomic(path, w))[1])
     with pytest.raises(SystemExit, match="1 task.*failed"):
         R.run_full(cfg_path2, workers=1, raw_dir=raw2)
+    monkeypatch.setattr(S, "write_atomic", real_atomic)
+    assert "RUN_STARTED.lock" in atomic                                                   # the lock is whole or absent
     res2 = repo2 / "results"
     assert (res2 / "RUN_STARTED.lock").exists() and not (res2 / "RUN_INFO.md").exists()
     lock = run_info_lock_fields(repo2)
-    assert set(lock) == {"started", "commit", "config_sha256", "prespec_sha256", "bundle_hashes"} and len(lock["bundle_hashes"]) == 7
-    assert S.task_done(res2 / "forecasts", "harq", "BBB") is None and S.task_done(res2 / "forecasts", "primary", "DDD") is not None
+    assert set(lock) == {"started", "commit", "config_sha256", "prespec_sha256", "bundle_hashes", "run_key"} and len(lock["bundle_hashes"]) == 7
+    key = lock["run_key"]
+    assert S.task_done(res2 / "forecasts", "harq", "BBB", key) is None and S.task_done(res2 / "forecasts", "primary", "DDD", key) is not None
     with pytest.raises(SystemExit, match="started before"):
         R.run_full(cfg_path2, workers=1, raw_dir=raw2)                                    # not without --resume
 
@@ -171,12 +179,17 @@ def test_an_interrupted_run_is_resumed_and_gives_the_same_results(tmp_path, monk
         R.run_full(cfg_path2, workers=1, resume=True, raw_dir=raw2)
     cfg_path2.write_text(cfg2.to_json())
 
+    # a stored task that carries the key of another run is not finished: it is computed again, with the unfinished one
+    marker = S.task_marker(res2 / "forecasts", "primary", "DDD")
+    stale = json.loads(marker.read_text())
+    stale["stamp"]["run_key"] = "0" * 64
+    marker.write_text(json.dumps(stale))
     ran = []
     monkeypatch.setattr(S, "run_task", lambda *a: (ran.append(a[1:3]), real(*a))[1])
     R.run_full(cfg_path2, workers=1, resume=True, raw_dir=raw2)
-    assert ran == [("harq", "BBB")]                                                       # only the unfinished task
+    assert ran == [("primary", "DDD"), ("harq", "BBB")]                                   # nothing else
     assert (res2 / "RUN_INFO.md").exists() and not (res2 / "RUN_STARTED.lock").exists()
-    assert "the run was resumed" in (res2 / "RUN_INFO.md").read_text()
+    assert "the run was resumed" in (res2 / "RUN_INFO.md").read_text() and key in (res2 / "RUN_INFO.md").read_text()
     assert {p.name: p.read_bytes() for p in (repo2 / "data" / "clean").glob("*.parquet")} == clean_ref
     for v in variants:
         for s in S.variant_symbols(cfg, v):
