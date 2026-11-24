@@ -300,8 +300,10 @@ def smoke_raw(plan, seed):
     return pd.concat([base, saturday, dup, bad], ignore_index=True).sort_values("ts", kind="stable").reset_index(drop=True), days
 
 
-def test_main_writes_the_report_overviews_and_day_files_for_every_instrument(tmp_path, monkeypatch):
-    """main() with the default paths writes one overview row, one section and one day file per instrument and a long-history overview."""
+@pytest.mark.parametrize("argv", [[], ["--config", "config/study_config.json"]], ids=["default config", "relative --config"])
+def test_main_writes_the_report_overviews_and_day_files_for_every_instrument(tmp_path, monkeypatch, argv):
+    """main() with the default paths writes one overview row, one section and one day file per instrument and a long-history overview.
+    A --config given relative to the working directory used to crash main() after all the computation, when the report header was written."""
     root = tmp_path.resolve()
     (root / "config").mkdir()
     instruments = [{"symbol": s, "asset_class": "FX" if s in ("AAA", "BBB") else "Precious metals", "start": "2024-01-08", "end": "2024-01-19",
@@ -318,7 +320,8 @@ def test_main_writes_the_report_overviews_and_day_files_for_every_instrument(tmp
     monkeypatch.setattr(SD, "verify_raw_hashes", lambda symbols: {f"{s}_M1_syn.csv": "00ff" for s in symbols})
     monkeypatch.setattr(SD, "raw_path", lambda symbol: Path(symbol))
     monkeypatch.setattr(SD, "load_m1", lambda path: frames[path.name][0].copy())
-    monkeypatch.setattr(sys, "argv", ["sample_definition.py"])
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(sys, "argv", ["sample_definition.py", *argv])
     SD.main()
     text = (root / "results/sample_definition.md").read_text()
 
