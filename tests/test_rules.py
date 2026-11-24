@@ -138,15 +138,29 @@ def test_stale_day_needs_more_than_half_zero_returns():
 
 
 def test_stale_share_ignores_the_window_and_gaps_between_bars():
-    days = pd.bdate_range("2024-01-02", periods=2)
+    stale_on = RVConfig(short_day_share=None, stale_share=0.5, excluded_windows=((1380, 60),))     # the rule is switched on
+    days = pd.bdate_range("2024-01-02", periods=3)
     close = walk(1440, 3, step=0.5)                                                    # moving prices ...
     close[:60] = close[1380:] = 100.0                                                  # ... but flat inside the window
-    d = daily_measures(day_bars(days[0], ALL, close), RVConfig(**NO_STALE))
-    assert d.iloc[0]["zero_share"] == 0.0 or np.isnan(d.iloc[0]["zero_share"]) or d.iloc[0]["zero_share"] < 0.01
+    d = daily_measures(day_bars(days[0], ALL, close), stale_on)
+    assert d.iloc[0]["zero_share"] == 0.0 and not d.iloc[0]["stale"]                   # the 118 flat window pairs are not counted
+    # the same on a day that is flat inside the window and has only a few moving bars outside: the window would make it stale
+    heavy = day_bars(days[1], np.r_[0:60, 60:80, 1380:1440], np.r_[np.full(60, 100.0), 100 + 0.5 * (np.arange(20) % 2 + 1), np.full(60, 100.0)])
+    d = daily_measures(heavy, stale_on)
+    assert d.iloc[0]["zero_share"] == 0.0 and not d.iloc[0]["stale"]
     # bars two minutes apart are not one-minute returns: a day of flat bars every other minute has no steps at all
-    sparse_flat = day_bars(days[1], np.arange(60, 1380, 2), np.full(660, 100.0))
-    d = daily_measures(sparse_flat, RVConfig(**NO_STALE))
+    sparse_flat = day_bars(days[2], np.arange(60, 1380, 2), np.full(660, 100.0))
+    d = daily_measures(sparse_flat, stale_on)
     assert np.isnan(d.iloc[0]["zero_share"]) and not d.iloc[0]["stale"]
+    # a pair across midnight is not a one-minute return of either day, also when no window hides 23:59 and 00:00
+    no_window = RVConfig(short_day_share=None, stale_share=0.5)
+    across = pd.concat([day_bars(days[0], np.array([1439]), np.array([100.0])),
+                        day_bars(days[1], np.array([0, 2, 4]), np.array([100.0, 100.0, 100.0]))], ignore_index=True)
+    d = daily_measures(across, no_window)
+    assert np.isnan(d.loc[days[1], "zero_share"]) and not d["stale"].any()
+    within = day_bars(days[1], np.array([0, 1, 2, 3]), np.array([100.0, 100.0, 100.0, 101.0]))   # 2 of 3 steps are zero
+    d = daily_measures(pd.concat([day_bars(days[0], np.array([1439]), np.array([100.0])), within], ignore_index=True), no_window)
+    assert d.loc[days[1], "zero_share"] == pytest.approx(2 / 3) and d.loc[days[1], "stale"]
 
 
 def test_stale_day_is_removed_and_its_move_goes_to_the_next_retained_day():
