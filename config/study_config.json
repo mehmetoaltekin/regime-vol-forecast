@@ -39,6 +39,6 @@
   "mcs_size": 0.1,
   "variants": ["primary", "rv_no_break", "rv_no_rollover", "rv_1min", "parkinson", "garman_klass", "hmm_rolling", "hmm_5bar",
                "k_bic", "log_har", "window_750", "window_1500", "long_history", "hmm_log_rv", "vintage", "harq"],
-  "long_history": {"EURUSD": "2000-01-03", "USDJPY": "2000-01-03", "GBPUSD": "2000-01-03", "XAUUSD": "2004-06-14"},
+  "long_history": {"EURUSD": "2000-01-03", "USDJPY": "2000-01-03", "GBPUSD": "2000-01-03", "XAUUSD": "2004-06-14", "XAGUSD": "2008-11-10"},
   "seed": 0
 }

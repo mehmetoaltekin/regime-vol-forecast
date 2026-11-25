@@ -309,5 +309,16 @@ def test_the_shipped_configuration_is_the_prespec_panel():
     assert all(i.rv == cfg.instruments[0].rv and i.clean == cfg.instruments[0].clean for i in cfg.instruments)
     assert (cfg.window, cfg.refit_every, cfg.burn_in, cfg.horizons) == (1000, 21, 22, (1, 5, 22))
     assert (cfg.min_ess, cfg.ms_starts, cfg.mcs_reps, cfg.mcs_block, cfg.mcs_size) == (100.0, 10, 10_000, 10, 0.10)
-    assert cfg.long_history == {"EURUSD": "2000-01-03", "USDJPY": "2000-01-03", "GBPUSD": "2000-01-03", "XAUUSD": "2004-06-14"}
+    assert cfg.long_history == {"EURUSD": "2000-01-03", "USDJPY": "2000-01-03", "GBPUSD": "2000-01-03", "XAUUSD": "2004-06-14",
+                                "XAGUSD": "2008-11-10"}
     assert len(cfg.variants) == 16 and cfg.prespec_version == "0.4"
+
+
+def test_robustness_check_6_runs_all_five_instruments_of_the_shipped_panel():
+    """XAGUSD has no longer history than the study sample (its long_history start is the sample start), but it is in check 6:
+    the check, its pooled test and its Holm family cover all five instruments of the panel."""
+    cfg = S.StudyConfig.from_json(S.Path(__file__).resolve().parents[1] / "config" / "study_config.json")
+    panel = ["XAUUSD", "XAGUSD", "EURUSD", "USDJPY", "GBPUSD"]
+    assert [i.symbol for i in cfg.instruments] == panel
+    assert S.variant_symbols(cfg, "long_history") == panel
+    assert cfg.long_history["XAGUSD"] == next(i.start for i in cfg.instruments if i.symbol == "XAGUSD")

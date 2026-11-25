@@ -123,9 +123,10 @@ in standard deviations over the window). `<variant>__regime_summary` counts the 
 warnings per refit and reports the share of refits in which the stress state differs more in the return than in the range
 (a split on the sign of the return rather than on volatility).
 
-Robustness check 6 (each instrument on its own longer minute-data history) is run for the four instruments that have one
-(`long_history` in the configuration: XAUUSD, EURUSD, USDJPY, GBPUSD). XAGUSD, whose history is unchanged, is not run again
-in that check, so its pooled test and Holm family cover four instruments.
+Robustness check 6 (each instrument on its own longer minute-data history) is run for all five instruments (`long_history`
+in the configuration: XAUUSD, XAGUSD, EURUSD, USDJPY, GBPUSD). XAGUSD has no longer history than the study sample, so its
+check 6 run repeats the main run (a test checks that its two daily bundles are identical); the pooled test and the Holm
+family of check 6 cover five instruments.
 
 ## Layout
 

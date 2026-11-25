@@ -266,6 +266,30 @@ def test_stage_zero_writes_the_bundles_of_every_instrument(tmp_path):
     assert bad == {} and len(failures) == 1 and "FileNotFoundError" in failures[0][1]
 
 
+def test_a_long_history_that_starts_with_the_sample_gives_the_same_daily_bundle_as_the_main_run(tmp_path):
+    """
+    Robustness check 6 for an instrument whose own minute data start with the study sample (XAGUSD): its "long" bundle is its
+    "main" bundle, day for day, column for column and byte for byte. With an earlier start the long bundle has more days.
+    """
+    r, days = noisy_days(70, seed=41)
+    write_m1(tmp_path / "AAA_M1_1_2.csv", to_m1(r, days))
+    spec = lambda s: S.InstrumentSpec(s, "2024-01-15", "2024-04-05", PANEL_RV, "FX" if s in ("AAA", "BBB") else "Metals", {})
+    for long_start, same in (("2024-01-15", True), ("2024-01-03", False)):
+        cfg = small_cfg(instruments=[spec(s) for s in ("AAA", "BBB", "CCC", "DDD")], long_history={"AAA": long_start},
+                        variants=("primary", "long_history"), window=20, refit_every=10)
+        cfg_path = tmp_path / f"cfg_{long_start}.json"
+        cfg_path.write_text(cfg.to_json())
+        clean = tmp_path / f"clean_{long_start}"
+        hashes = S.prepare_instrument(str(cfg_path), "AAA", str(clean), str(tmp_path))
+        assert list(hashes) == ["daily__AAA__main.parquet", "daily__AAA__long.parquet"]
+        main, long = (pd.read_parquet(S.bundle_file(clean, "AAA", sample)) for sample in ("main", "long"))
+        if same:
+            pd.testing.assert_frame_equal(long, main)
+            assert hashes["daily__AAA__long.parquet"] == hashes["daily__AAA__main.parquet"]
+        else:
+            assert len(long) > len(main) and long.index[0] < main.index[0] and long.index[-1] == main.index[-1]
+
+
 # ------------------------------------------------------------------------------------------ degenerate input
 
 def test_mcs_and_giacomini_white_survive_identical_models_and_a_constant_instrument():
