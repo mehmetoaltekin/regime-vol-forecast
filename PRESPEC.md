@@ -4,7 +4,7 @@
 - **Version:** 0.4 (draft, panel decided), 2026-11-24
 - **Status:** DRAFT. This becomes binding once author approves it and the approved version
   (1.0) is committed to the repo and tagged `prespec-v1.0` before any out-of-sample run.
-  All design decisions are closed; what remains is Saye's approval.
+  All design decisions are closed; what remains is author approval.
 - **Changes from earlier versions:** listed in §15.
 
 ---
@@ -359,7 +359,7 @@ likewise stated for FX and precious metals only. The title and the abstract name
 4. Code is developed and debugged only on the first training window of US500, which is not
    part of the panel (§12.8). The full run is executed once, on frozen code. The commit
    hash, package versions and run date are recorded in `results/RUN_INFO.md`.
-5. The results are handed to Saye uninterpreted before any writing starts.
+5. The results are handed to author uninterpreted before any writing starts.
 
 ## 12. Decisions fixed after the data audit
 
