@@ -1,9 +1,8 @@
 # Pre-specification: Does HMM regime information improve daily volatility forecasts?
 
 - **Study:** 1 of 3 in the HMM regime series (repo `regime-vol-forecast`)
-- **Author:** Saye
 - **Version:** 0.4 (draft, panel decided), 2026-11-24
-- **Status:** DRAFT. This becomes binding once Saye approves it and the approved version
+- **Status:** DRAFT. This becomes binding once author approves it and the approved version
   (1.0) is committed to the repo and tagged `prespec-v1.0` before any out-of-sample run.
   All design decisions are closed; what remains is Saye's approval.
 - **Changes from earlier versions:** listed in §15.
